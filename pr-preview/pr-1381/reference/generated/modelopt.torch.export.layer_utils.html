@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>layer_utils &mdash; Model Optimizer 0.0.1.dev1+gee478d358</title>
+  <title>layer_utils &mdash; Model Optimizer 0.0.1.dev1+gaae8c331f</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
@@ -285,10 +285,13 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.export.layer_utils.set_expert_quantizer_amax" title="modelopt.torch.export.layer_utils.set_expert_quantizer_amax"><code class="xref py py-obj docutils literal notranslate"><span class="pre">set_expert_quantizer_amax</span></code></a></p></td>
 <td><p>Set amax values for expert quantizers using smart fallback logic.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.export.layer_utils.sync_moe_gate_up_amax" title="modelopt.torch.export.layer_utils.sync_moe_gate_up_amax"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sync_moe_gate_up_amax</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.export.layer_utils.sync_linear_attn_fused_projection_amax" title="modelopt.torch.export.layer_utils.sync_linear_attn_fused_projection_amax"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sync_linear_attn_fused_projection_amax</span></code></a></p></td>
+<td><p>Sync quantizer amaxes for GDN projections that serving engines fuse.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.export.layer_utils.sync_moe_gate_up_amax" title="modelopt.torch.export.layer_utils.sync_moe_gate_up_amax"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sync_moe_gate_up_amax</span></code></a></p></td>
 <td><p>Take element-wise max of gate and up weight quantizer amaxes per expert.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.export.layer_utils.update_experts_avg_prequant_scale" title="modelopt.torch.export.layer_utils.update_experts_avg_prequant_scale"><code class="xref py py-obj docutils literal notranslate"><span class="pre">update_experts_avg_prequant_scale</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.export.layer_utils.update_experts_avg_prequant_scale" title="modelopt.torch.export.layer_utils.update_experts_avg_prequant_scale"><code class="xref py py-obj docutils literal notranslate"><span class="pre">update_experts_avg_prequant_scale</span></code></a></p></td>
 <td><p>Registers experts_pre_quant_scale attribute of each expert with average pre_quant_scale amongst experts.</p></td>
 </tr>
 </tbody>
@@ -791,6 +794,28 @@ If None, defaults to [“input_quantizer”] for backward compatibility.</p></li
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>uncalibrated_modules</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="modelopt.torch.export.layer_utils.sync_linear_attn_fused_projection_amax">
+<span class="sig-name descname"><span class="pre">sync_linear_attn_fused_projection_amax</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.export.layer_utils.sync_linear_attn_fused_projection_amax" title="Link to this definition"></a></dt>
+<dd><p>Sync quantizer amaxes for GDN projections that serving engines fuse.</p>
+<p>Qwen3.5/Qwen3-Next GDN exports keep <code class="docutils literal notranslate"><span class="pre">in_proj_qkv</span></code> and <code class="docutils literal notranslate"><span class="pre">in_proj_z</span></code> as
+separate HF tensors, but vLLM fuses them into <code class="docutils literal notranslate"><span class="pre">in_proj_qkvz</span></code> at load time.
+Likewise <code class="docutils literal notranslate"><span class="pre">in_proj_b</span></code> and <code class="docutils literal notranslate"><span class="pre">in_proj_a</span></code> may be fused as <code class="docutils literal notranslate"><span class="pre">in_proj_ba</span></code>.
+Sharing the quantizer scale domains before export avoids serving-time fused
+loaders having to reconcile different scalar/global scales.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Number of projection pairs whose scale state changed.</p>
+</dd>
+<dt class="field-even">Parameters<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>model</strong> (<em>Module</em>)</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><em>int</em></p>
 </dd>
 </dl>
 </dd></dl>

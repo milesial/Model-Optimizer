@@ -72,6 +72,7 @@ layer\_utils
       is_recurrent
       model_type_is_enc_dec
       set_expert_quantizer_amax
+      sync_linear_attn_fused_projection_amax
       sync_moe_gate_up_amax
       update_experts_avg_prequant_scale
    
