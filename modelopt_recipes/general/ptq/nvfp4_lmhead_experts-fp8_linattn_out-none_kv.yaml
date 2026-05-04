@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+metadata:
+  recipe_type: ptq
+  description: >
+    Diagnostic recipe: NVFP4 lm_head + NVFP4 routed experts plus FP8 W8A8
+    GDN linear_attn.out_proj only. Other GDN projections, self_attn, and
+    shared experts stay BF16.
+quantize:
+  algorithm:
+    method: max
+    layerwise: false
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+
+    - quantizer_name: '*mlp.experts*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*mlp.experts*input_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*block_sparse_moe*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*block_sparse_moe*input_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+
+    - quantizer_name: '*lm_head*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*lm_head*input_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+
+    - quantizer_name: '*linear_attn.out_proj*weight_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        axis:
+    - quantizer_name: '*linear_attn.out_proj*input_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+        axis:
+
+    - quantizer_name: '*linear_attn.conv1d*'
+      enable: false
+    - quantizer_name: '*linear_attn.in_proj_a*'
+      enable: false
+    - quantizer_name: '*linear_attn.in_proj_b*'
+      enable: false
+    - quantizer_name: '*linear_attn.in_proj_qkv*'
+      enable: false
+    - quantizer_name: '*linear_attn.in_proj_z*'
+      enable: false
+    - quantizer_name: '*mlp.shared_expert*'
+      enable: false
+    - quantizer_name: '*mlp.gate.*'
+      enable: false
+    - quantizer_name: '*mlp.shared_expert_gate.*'
+      enable: false
+    - quantizer_name: '*router*'
+      enable: false
+    - quantizer_name: '*block_sparse_moe.gate*'
+      enable: false
+    - quantizer_name: '*visual*'
+      enable: false
+    - quantizer_name: '*vision_tower*'
+      enable: false
+    - quantizer_name: '*mtp*'
+      enable: false
