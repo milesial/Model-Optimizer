@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Install ModelOpt-Windows as a Standalone Toolkit &mdash; Model Optimizer 0.0.1.dev1+g2d54ad94c</title>
+  <title>Install ModelOpt-Windows as a Standalone Toolkit &mdash; Model Optimizer 0.0.1.dev1+g955b22d04</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
@@ -194,6 +194,20 @@ pip<span class="w"> </span>install<span class="w"> </span>onnxruntime-directml
 </div></blockquote>
 <p><strong>5. Setup GPU Acceleration Tool for Quantization</strong></p>
 <p>By default, ModelOpt-Windows utilizes the <a class="reference external" href="https://cupy.dev//" rel="noopener noreferrer" target="_blank">cupy-cuda12x</a> tool for GPU acceleration during the INT4 ONNX quantization process. This is compatible with CUDA 12.x.</p>
+<p>If you are using CUDA 13.x, update CUDA-dependent packages manually:</p>
+<p>For official ONNX Runtime guidance, see <a class="reference external" href="https://onnxruntime.ai/docs/install/#nightly-for-cuda-13x" rel="noopener noreferrer" target="_blank">Nightly builds for CUDA 13.x</a>.</p>
+<ol class="arabic simple">
+<li><p>Uninstall <code class="docutils literal notranslate"><span class="pre">cupy-cuda12x</span></code> and install <code class="docutils literal notranslate"><span class="pre">cupy-cuda13x</span></code>.</p></li>
+<li><p>Uninstall <code class="docutils literal notranslate"><span class="pre">onnxruntime-genai-cuda</span></code> and <code class="docutils literal notranslate"><span class="pre">onnxruntime-gpu</span></code>.</p></li>
+<li><p>Install ONNX Runtime CUDA 13 nightly and the pre-release <code class="docutils literal notranslate"><span class="pre">onnxruntime-genai-cuda</span></code> package.</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>uninstall<span class="w"> </span>-y<span class="w"> </span>cupy-cuda12x<span class="w"> </span>onnxruntime-genai-cuda<span class="w"> </span>onnxruntime-gpu
+pip<span class="w"> </span>install<span class="w"> </span>cupy-cuda13x
+pip<span class="w"> </span>install<span class="w"> </span>coloredlogs<span class="w"> </span>flatbuffers<span class="w"> </span>numpy<span class="w"> </span>packaging<span class="w"> </span>protobuf<span class="w"> </span>sympy
+pip<span class="w"> </span>install<span class="w"> </span>--pre<span class="w"> </span>--index-url<span class="w"> </span>https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/<span class="w"> </span>onnxruntime-gpu
+pip<span class="w"> </span>install<span class="w"> </span>--pre<span class="w"> </span>onnxruntime-genai-cuda
+</pre></div>
+</div>
 <p><strong>6. Verify Installation</strong></p>
 <dl>
 <dt>Ensure the following steps are verified:</dt><dd><ul>

@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>checkpoint_utils_hf &mdash; Model Optimizer 0.0.1.dev1+g2d54ad94c</title>
+  <title>checkpoint_utils_hf &mdash; Model Optimizer 0.0.1.dev1+g955b22d04</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
@@ -189,10 +189,13 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_checkpoint" title="modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_checkpoint"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_checkpoint</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_subblocks" title="modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_subblocks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_subblocks</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_checkpoint_from_shards" title="modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_checkpoint_from_shards"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_checkpoint_from_shards</span></code></a></p></td>
+<td><p>Save a checkpoint when the model's weights are sharded across distributed ranks.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_subblocks" title="modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_subblocks"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_subblocks</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_model_config" title="modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_model_config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_model_config</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_model_config" title="modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_model_config"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_model_config</span></code></a></p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -260,6 +263,30 @@ trust the source of the model. Defaults to False for security.</p></li>
 <li><p><strong>model</strong> (<em>PreTrainedModel</em>)</p></li>
 <li><p><strong>checkpoint_dir</strong> (<em>Path</em><em> | </em><em>str</em>)</p></li>
 <li><p><strong>descriptor</strong> (<a class="reference internal" href="modelopt.torch.puzzletron.anymodel.model_descriptor.base.html#modelopt.torch.puzzletron.anymodel.model_descriptor.base.ModelDescriptor" title="modelopt.torch.puzzletron.anymodel.model_descriptor.base.ModelDescriptor"><em>ModelDescriptor</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><em>None</em></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_checkpoint_from_shards">
+<span class="sig-name descname"><span class="pre">save_checkpoint_from_shards</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">checkpoint_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">descriptor</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.puzzletron.tools.checkpoint_utils_hf.save_checkpoint_from_shards" title="Link to this definition"></a></dt>
+<dd><p>Save a checkpoint when the model’s weights are sharded across distributed ranks.</p>
+<p>Gathers each rank’s partial state dictionary onto rank 0 and writes a complete checkpoint
+(including the safetensors index and subblocks) from the merged weights. On a single-process
+run, saves directly from the local state dict. Only rank 0 performs the filesystem write;
+non-master ranks only participate in the gather.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model</strong> (<em>PreTrainedModel</em>) – The model instance whose local state_dict contains this rank’s</p></li>
+<li><p><strong>weights.</strong> (<em>shard of</em>)</p></li>
+<li><p><strong>checkpoint_dir</strong> (<em>Path</em><em> | </em><em>str</em>) – Destination directory for the checkpoint files.</p></li>
+<li><p><strong>descriptor</strong> (<a class="reference internal" href="modelopt.torch.puzzletron.anymodel.model_descriptor.base.html#modelopt.torch.puzzletron.anymodel.model_descriptor.base.ModelDescriptor" title="modelopt.torch.puzzletron.anymodel.model_descriptor.base.ModelDescriptor"><em>ModelDescriptor</em></a>) – Descriptor used to partition weights into subblocks and build</p></li>
+<li><p><strong>index.</strong> (<em>the safetensors</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
