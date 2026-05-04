@@ -21,7 +21,10 @@ from pathlib import Path
 from typing import Any
 
 import modelopt.torch.utils.distributed as dist
-from modelopt.torch.puzzletron.tools.logger import aprint, mprint
+
+from ..tools.logger import aprint, mprint
+
+__all__ = ["ScoringCheckpointManager"]
 
 
 class ScoringCheckpointManager:
@@ -187,7 +190,7 @@ class ScoringCheckpointManager:
             # All ranks save their hook states
             if self.activation_hooks is not None:
                 try:
-                    from modelopt.torch.nas.plugins.megatron_hooks.base_hooks import ForwardHook
+                    from modelopt.torch.prune.importance_hooks.base_hooks import ForwardHook
 
                     ForwardHook.save_hook_states(self.activation_hooks, self.checkpoint_dir)
                 except Exception as e:
@@ -240,7 +243,7 @@ class ScoringCheckpointManager:
         # All ranks save their final hook states
         if self.activation_hooks is not None:
             try:
-                from modelopt.torch.nas.plugins.megatron_hooks.base_hooks import ForwardHook
+                from modelopt.torch.prune.importance_hooks.base_hooks import ForwardHook
 
                 saved_path = ForwardHook.save_hook_states(
                     self.activation_hooks, self.checkpoint_dir

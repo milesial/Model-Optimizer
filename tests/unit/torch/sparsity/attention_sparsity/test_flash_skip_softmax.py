@@ -30,7 +30,7 @@ class TestFlashSkipSoftmaxMethod:
         """Test phase detection from attention score shape."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-4},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -50,7 +50,7 @@ class TestFlashSkipSoftmaxMethod:
         """Test threshold updates with dict config."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-5},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-5]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -58,23 +58,23 @@ class TestFlashSkipSoftmaxMethod:
             }
         )
 
-        # Initially uses prefill threshold
-        initial_threshold = method.threshold
+        # Initially uses prefill thresholds
+        initial_thresholds = method.thresholds
 
         # Update to decode
-        method._update_threshold("decode")
-        assert method.threshold == 1e-5
-        assert method.threshold != initial_threshold
+        method._update_thresholds("decode")
+        assert method.thresholds == [1e-5]
+        assert method.thresholds != initial_thresholds
 
         # Update back to prefill
-        method._update_threshold("prefill")
-        assert method.threshold == 1e-3
+        method._update_thresholds("prefill")
+        assert method.thresholds == [1e-3]
 
     def test_block_reshaping_divisible(self):
         """Test block reshaping with divisible sequence lengths."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-4},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -97,7 +97,7 @@ class TestFlashSkipSoftmaxMethod:
         """Test block reshaping with non-divisible lengths."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-4},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -120,7 +120,7 @@ class TestFlashSkipSoftmaxMethod:
         """Test correction factor for prefill phase."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-4},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -140,14 +140,15 @@ class TestFlashSkipSoftmaxMethod:
         assert "total_blocks" in stats
         assert stats["phase"] == "prefill"
         assert 0 <= stats["correction_factor"] <= 1
-        # Sparsity can be negative if threshold is too low (more blocks kept than expected)
-        assert -1 <= stats["sparsity"] <= 1
+        # sparsity is now a list (one entry per threshold)
+        assert isinstance(stats["sparsity"], list)
+        assert all(-1 <= s <= 1 for s in stats["sparsity"])
 
     def test_correction_factor_calculation_decode(self):
         """Test correction factor for decode phase."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-5},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-5]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -163,14 +164,15 @@ class TestFlashSkipSoftmaxMethod:
         # Verify stats structure
         assert stats["phase"] == "decode"
         assert "correction_factor" in stats
-        assert 0 <= stats["sparsity"] <= 1
+        assert isinstance(stats["sparsity"], list)
+        assert all(0 <= s <= 1 for s in stats["sparsity"])
         assert mask.shape == (1, 1, 1, 256)
 
     def test_block_mask_correctness(self):
         """Test block mask shape and type."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-4},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -189,7 +191,7 @@ class TestFlashSkipSoftmaxMethod:
     def test_causal_vs_noncausal(self):
         """Test total_blocks calculation for causal vs non-causal."""
         config_base = {
-            "threshold": {"prefill": 1e-3, "decode": 1e-4},
+            "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
             "br": 128,
             "bc": 128,
             "backend": "pytorch",
@@ -212,7 +214,7 @@ class TestFlashSkipSoftmaxMethod:
         """Test calculate_sparsity input validation."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-4},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -228,7 +230,7 @@ class TestFlashSkipSoftmaxMethod:
         """Test apply_sparsity with pre-computed mask."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-4},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -255,7 +257,7 @@ class TestFlashSkipSoftmaxMethod:
         """Test apply_sparsity calculates mask internally when None."""
         method = FlashSkipSoftmax(
             {
-                "threshold": {"prefill": 1e-3, "decode": 1e-4},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
                 "br": 128,
                 "bc": 128,
                 "backend": "pytorch",
@@ -270,3 +272,127 @@ class TestFlashSkipSoftmaxMethod:
 
         # Verify output shape matches input
         assert sparse_attn.shape == attn.shape
+
+    def test_calibrated_path_prefill(self):
+        """Dynamic calibrated threshold path is exercised when params/targets are set."""
+        method = FlashSkipSoftmax(
+            {
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
+                "br": 128,
+                "bc": 128,
+                "backend": "pytorch",
+                "is_causal": False,
+            }
+        )
+        method.calibration_params = {"prefill": {"a": 1.0, "b": 5.0}}
+        method.target_sparse_ratio = {"prefill": 0.5}
+
+        attn = torch.randn(1, 2, 128, 256)
+        mask, stats = method.calc_correction_factor_and_p(attn, "prefill")
+        # calibrated single-threshold path yields one sparsity entry
+        assert len(stats["sparsity"]) == 1
+        assert mask is not None
+
+    def test_calibrated_path_decode(self):
+        """Decode with calibrated params."""
+        method = FlashSkipSoftmax(
+            {
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
+                "br": 128,
+                "bc": 128,
+                "backend": "pytorch",
+                "is_causal": False,
+            }
+        )
+        method.calibration_params = {"decode": {"a": 0.5, "b": 4.0}}
+        method.target_sparse_ratio = {"decode": 0.6}
+
+        attn = torch.randn(1, 2, 1, 256)
+        mask, stats = method.calc_correction_factor_and_p(attn, "decode")
+        assert stats["phase"] == "decode"
+        assert len(stats["sparsity"]) == 1
+
+    def test_get_threshold_info_calibrated(self):
+        """get_threshold_info returns dynamic_calibrated type when calibrated."""
+        method = FlashSkipSoftmax(
+            {
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
+                "br": 128,
+                "bc": 128,
+                "backend": "pytorch",
+                "is_causal": True,
+            }
+        )
+        method.calibration_params = {"prefill": {"a": 1.0, "b": 5.0}}
+        method.target_sparse_ratio = {"prefill": 0.5}
+        info = method.get_threshold_info()
+        assert info["type"] == "dynamic_calibrated"
+        assert "phases" in info
+        assert "prefill" in info["phases"]
+        assert "scale_factor" in info["phases"]["prefill"]
+
+    def test_get_threshold_info_static(self):
+        """get_threshold_info returns static type when no calibration."""
+        method = FlashSkipSoftmax(
+            {
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
+                "br": 128,
+                "bc": 128,
+                "backend": "pytorch",
+                "is_causal": True,
+            }
+        )
+        info = method.get_threshold_info()
+        assert info["type"] == "static"
+        assert "value" in info
+
+    def test_get_sparse_context_patches_softmax(self):
+        """get_sparse_context returns an ExitStack that patches F.softmax."""
+        import torch.nn.functional as F
+
+        method = FlashSkipSoftmax(
+            {
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
+                "br": 64,
+                "bc": 64,
+                "backend": "pytorch",
+                "is_causal": True,
+            }
+        )
+
+        module = type("M", (), {"_last_stats": None})()
+        original_softmax = F.softmax
+        stack = method.get_sparse_context(module)
+        with stack:
+            # Inside the context, softmax should be patched
+            assert F.softmax is not original_softmax
+            # Call it once to exercise the sparse_softmax wrapper
+            scores = torch.randn(1, 1, 64, 64)
+            F.softmax(scores, dim=-1)
+            assert module._last_stats is not None
+
+        # After the context, softmax is restored
+        assert F.softmax is original_softmax
+
+    def test_calibration_mode_skips_apply(self):
+        """In calibration mode, sparse_softmax wrapper does not apply mask."""
+        import torch.nn.functional as F
+
+        method = FlashSkipSoftmax(
+            {
+                "thresholds": {"prefill": [1e-3], "decode": [1e-4]},
+                "br": 64,
+                "bc": 64,
+                "backend": "pytorch",
+                "is_causal": True,
+            }
+        )
+        method.set_calibration_mode(True)
+        module = type("M", (), {"_last_stats": None})()
+
+        with method.get_sparse_context(module):
+            scores = torch.randn(1, 1, 64, 64)
+            # Should not apply sparsity — output is regular softmax
+            out = F.softmax(scores, dim=-1)
+            assert torch.allclose(out.sum(dim=-1), torch.ones_like(out.sum(dim=-1)))
+        method.set_calibration_mode(False)

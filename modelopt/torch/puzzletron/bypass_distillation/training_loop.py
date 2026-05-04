@@ -51,7 +51,7 @@ from modelopt.torch.puzzletron.sewing_kit import InputArgs, StitchedModule
 from modelopt.torch.puzzletron.sewing_kit.utils import fake_tensor
 from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import load_model_config
 from modelopt.torch.puzzletron.tools.logger import aprint, mprint
-from modelopt.torch.puzzletron.tools.robust_json import json_load
+from modelopt.torch.utils.robust_json import json_load
 from modelopt.torch.puzzletron.tools.sharded_checkpoint_utils import load_and_shard_model
 from modelopt.torch.puzzletron.utils.parsing import format_global_config, format_stitched_losses
 

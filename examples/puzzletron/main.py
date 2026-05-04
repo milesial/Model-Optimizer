@@ -40,7 +40,7 @@ import modelopt.torch.nas as mtn
 import modelopt.torch.puzzletron.mip.mip_and_realize_models as mip_and_realize_models
 import modelopt.torch.puzzletron.mip.sweep as sweep
 import modelopt.torch.utils.distributed as dist
-from modelopt.torch.puzzletron.nas.plugins.puzzletron_nas_plugin import (
+from modelopt.torch.puzzletron.puzzletron_nas_plugin import (
     PuzzletronModel,
     _total_steps,
 )

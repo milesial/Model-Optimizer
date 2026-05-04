@@ -39,29 +39,28 @@ from typing import Any, Type
 import pandas as pd
 from omegaconf import DictConfig
 
-from modelopt.torch.puzzletron.anymodel.model_descriptor import (
-    ModelDescriptor,
-    ModelDescriptorFactory,
-)
-from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import (
-    AttentionConfig,
-    BlockConfig,
-    FFNConfig,
-)
-from modelopt.torch.puzzletron.replacement_library.replacement_utils import (
-    is_replacement_identical_to_teacher,
-    replacement_is_teacher,
-    sort_replacements,
-)
-from modelopt.torch.puzzletron.tools.checkpoint_utils import (
+from modelopt.torch.utils import json_dump
+
+from ..anymodel.model_descriptor import ModelDescriptor, ModelDescriptorFactory
+from ..block_config import AttentionConfig, BlockConfig, FFNConfig
+from ..mip.utils import sort_replacements
+from ..tools.checkpoint_utils import (
     SAFETENSORS_SUBBLOCKS_DIR_NAME,
     is_valid_decilm_checkpoint,
     load_model_config,
 )
-from modelopt.torch.puzzletron.tools.logger import mprint
-from modelopt.torch.puzzletron.tools.robust_json import json_dump
-from modelopt.torch.puzzletron.utils.parsing import format_global_config
-from modelopt.torch.puzzletron.utils.utils import block_config_to_str, subblock_config_to_str
+from ..tools.logger import mprint
+from ..utils.misc import block_config_to_str, subblock_config_to_str
+from ..utils.parsing import format_global_config
+from .replacement_utils import is_replacement_identical_to_teacher, replacement_is_teacher
+
+__all__ = [
+    "UNIQUE_SUBBLOCK_IDENTIFIER",
+    "CHECKPOINTS_DIR_NAME",
+    "build_replacement_library",
+    "launch_build_replacement_library",
+    "infer_teacher_dir",
+]
 
 UNIQUE_SUBBLOCK_IDENTIFIER = ["block_config", "attention_config", "ffn_config", "block_idx"]
 CHECKPOINTS_DIR_NAME = "ckpts"
@@ -89,7 +88,7 @@ def build_replacement_library(
         add_attention_no_ops,
         trust_remote_code=trust_remote_code,
     )
-    block_library_df = _build_block_library_from_subblocks(subblocks_df)
+    block_library_df = _build_block_library_from_subblocks(subblocks_df, master_puzzle_dir)
 
     layer_replacements = _build_layer_replacements(
         block_library_df, master_puzzle_dir, teacher_checkpoint_dir, trust_remote_code
@@ -144,7 +143,9 @@ def infer_teacher_dir(
     return teacher_checkpoint_dir
 
 
-def _build_block_library_from_subblocks(subblocks_df: pd.DataFrame) -> pd.DataFrame:
+def _build_block_library_from_subblocks(
+    subblocks_df: pd.DataFrame, output_dir: Path
+) -> pd.DataFrame:
     joint_blocks_df = subblocks_df.dropna(subset=["block_config"]).copy()
     constructed_blocks_df = _construct_blocks_from_subblocks(subblocks_df)
 
@@ -165,8 +166,12 @@ def _build_block_library_from_subblocks(subblocks_df: pd.DataFrame) -> pd.DataFr
         dups_with_same_block_idx = dups[dups["block_idx"] == dup_block_idx]
         for _, row in dups_with_same_block_idx.head(10).iterrows():
             mprint(row.to_dict())
-        json_dump(block_library_df.to_dict(orient="records"), "ERROR_block_library.json")
-        json_dump(subblocks_df.to_dict(orient="records"), "ERROR_subblock_library.json")
+        json_dump(
+            block_library_df.to_dict(orient="records"), output_dir / "ERROR_block_library.json"
+        )
+        json_dump(
+            subblocks_df.to_dict(orient="records"), output_dir / "ERROR_subblock_library.json"
+        )
         raise ValueError(
             f"Found {len(dups)} duplicate blocks in the block library. See ERROR_block_library.json and ERROR_subblock_library.json for more details."
         )
@@ -422,7 +427,7 @@ def _get_last_checkpoint_from_each_experiment(
                 "If you are Ido Galil, tell Tomer that you got this exception ;) "
             )
 
-    # Filter out non-DeciLM checkpoints (e.g., unconverted Llama checkpoints)
+    # Filter out checkpoints without block_configs (e.g. unconverted raw HF layouts)
     valid_checkpoint_dirs = [
         cp
         for cp in checkpoint_dirs
@@ -504,13 +509,18 @@ def _build_layer_replacements_from_block_library(block_library_df: pd.DataFrame)
         weight_paths = []
         for subblock_name in ["attention", "ffn"]:
             checkpoint_dir = row[f"{subblock_name}_checkpoint_dir"]
-            if checkpoint_dir is not None:
-                subblock_path = (
-                    Path(checkpoint_dir)
-                    / SAFETENSORS_SUBBLOCKS_DIR_NAME
-                    / f"block_{block_idx}_{subblock_name}.safetensors"
-                )
-                weight_paths.append(subblock_path)
+            # pandas represents missing cells as float NaN (e.g. for no-op subblocks),
+            # so check for both None and NaN before constructing a Path.
+            if checkpoint_dir is None or (
+                isinstance(checkpoint_dir, float) and pd.isna(checkpoint_dir)
+            ):
+                continue
+            subblock_path = (
+                Path(checkpoint_dir)
+                / SAFETENSORS_SUBBLOCKS_DIR_NAME
+                / f"block_{block_idx}_{subblock_name}.safetensors"
+            )
+            weight_paths.append(subblock_path)
         weight_paths = sorted(set(weight_paths))
         layer_replacement = {
             "parent_layer_indices": [block_idx],

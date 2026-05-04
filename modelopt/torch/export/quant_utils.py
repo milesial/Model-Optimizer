@@ -42,6 +42,7 @@ from modelopt.torch.quantization.utils import (
     QuantizerAttrNames,
     quantizer_attr_names,
     reduce_block_amax,
+    representative_weight_quantizer,
     weight_attr_names,
 )
 from modelopt.torch.utils import clear_cuda_cache
@@ -474,6 +475,8 @@ def get_kv_cache_scaling_factor(self_attention_module: nn.Module) -> list[torch.
     # For FP8, we recommend default kv cache scaling factor to be 1.
     if get_kv_cache_dtype(self_attention_module) == KV_CACHE_FP8:
         for i, factor in enumerate(scaling_factors):
+            if factor is None:
+                continue
             if factor.item() > 0.5:
                 warn(
                     f"Warning: Large KV activation detected: {factor.item()}, "
@@ -512,23 +515,24 @@ def get_kv_cache_dtype(modules: list[nn.Module] | nn.Module) -> str | None:
                 num_bits_list.append(quantizer_attr.num_bits)
                 is_affine &= hasattr(quantizer_attr, "_bias_value")
 
-    return _compute_kv_cache_dtype(num_bits_list)
+    return _compute_kv_cache_dtype(num_bits_list, is_affine)
 
 
-def _compute_kv_cache_dtype(num_bits_list: list[int | tuple[int, int]]) -> str | None:
+def _compute_kv_cache_dtype(
+    num_bits_list: list[int | tuple[int, int]], is_affine: bool = False
+) -> str | None:
     """Returns the kv_cache dtype.
 
     If num_bits of output_quantizer is (4, 3) then returns FP8; if it is 8, returns int8,
     otherwise returns None.
 
     Args:
-        modules: The module or list of modules to inspect.
+        num_bits_list: The list of num_bits from quantizers.
+        is_affine: Whether the quantizers have bias (affine mode).
 
     Returns:
         The kv_cache dtype.
     """
-    is_affine = True
-
     if (4, 3) in num_bits_list:
         return KV_CACHE_FP8
     elif 8 in num_bits_list:
@@ -543,7 +547,7 @@ def _compute_kv_cache_dtype(num_bits_list: list[int | tuple[int, int]]) -> str |
 
 def get_weight_block_size(module: nn.Module, weight_name: str = "weight") -> int:
     """Returns the weight block size."""
-    weight_quantizer = getattr(module, quantizer_attr_names(weight_name).weight_quantizer, None)
+    weight_quantizer = representative_weight_quantizer(module, weight_name)
 
     if weight_quantizer is None:
         return 0
@@ -569,7 +573,11 @@ def get_quantization_format(module) -> str | None:
     """
 
     def _get_quantization_from_layer(layer, quantizer_attr_names: QuantizerAttrNames):
-        weight_quantizer = getattr(layer, quantizer_attr_names.weight_quantizer, None)
+        # Singular form first, plural ModuleList fallback (fused-experts).
+        # Strip the "_weight_quantizer" suffix to recover the weight attr name.
+        weight_attr = quantizer_attr_names.weight_quantizer
+        weight_name = weight_attr[: -len("_weight_quantizer")].rstrip("_") or "weight"
+        weight_quantizer = representative_weight_quantizer(layer, weight_name)
         input_quantizer = getattr(layer, quantizer_attr_names.input_quantizer, None)
 
         if weight_quantizer is None or not weight_quantizer.is_enabled:
@@ -737,7 +745,15 @@ def _prefix_wildcard_summarize_exclude_modules(unquantized_layers, quantized_lay
                 f"Unquantized layer {layer}, prefix wildcards {wildcards} identified as a new match"
             )
             break
-        res_summary.update(candidate_wildcards)
+        # When candidate is the pair [prefix, prefix+".*"], emit only prefix+".*" for deployment.
+        if len(candidate_wildcards) == 2:
+            a, b = sorted(candidate_wildcards, key=len)
+            if b == a + ".*":
+                res_summary.add(b)
+            else:
+                res_summary.update(candidate_wildcards)
+        else:
+            res_summary.update(candidate_wildcards)
     return res_summary
 
 
@@ -1087,14 +1103,8 @@ def postprocess_state_dict(
                     # Warn if scale exceeds threshold
                     if quantization == KV_CACHE_FP8 and value.item() > 0.5:
                         logger.warning(
-                            "Large KV activations detected. Quantized KV cache may lead to higher accuracy drop. "
-                            "Setting KV cache scaling factor to at least 1."
+                            "Large KV activations detected. Quantized KV cache may lead to higher accuracy drop."
                         )
-
-                    # Ensure scale is at least 1 for KV_CACHE_FP8
-                    # We export real value for KV_CACHE_NVFP4
-                    if quantization == KV_CACHE_FP8:
-                        value.clamp_(min=1.0)
                 post_state_dict[prefix + new_suffix] = value
                 break
 

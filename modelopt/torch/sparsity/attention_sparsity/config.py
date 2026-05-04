@@ -18,7 +18,7 @@
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from modelopt.torch.opt.config import ModeloptBaseConfig, ModeloptField
 
@@ -46,12 +46,14 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
         description="If True, enables sparse attention. If False, bypasses sparsity.",
     )
 
-    threshold: dict[str, float] = ModeloptField(
-        default={"prefill": 1e-3, "decode": 1e-4},
-        title="Sparsity threshold.",
+    thresholds: dict[str, list[float]] = ModeloptField(
+        default={"prefill": [1e-3], "decode": [1e-4]},
+        title="Sparsity thresholds.",
         description=(
-            "Threshold for determining which attention values to skip. "
-            "Must be a dict with 'prefill' and 'decode' keys."
+            "Thresholds for determining which attention values to skip. "
+            "Must be a dict with 'prefill' and/or 'decode' keys, each mapping to a list of floats. "
+            "Prefill and decode lists must have the same length. "
+            "Sparsity is computed per threshold; the first threshold's mask is applied."
         ),
     )
 
@@ -72,8 +74,8 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
         title="Backend implementation.",
         description=(
             "Backend to use for sparse attention computation. "
-            "Only 'pytorch' is supported, which uses softmax patching with F.softmax. "
-            "Requires model to be loaded with attn_implementation='eager'."
+            "'pytorch' uses softmax patching with F.softmax (requires attn_implementation='eager'). "
+            "'triton' uses the fused Triton kernel (requires attn_implementation='modelopt_triton')."
         ),
     )
 
@@ -89,7 +91,62 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
         description=(
             "Whether the model uses causal (autoregressive) attention. "
             "If True, sparsity statistics are calculated over the lower triangle only. "
+            "Set to False for cross-attention models. "
             "Defaults to True for decoder-only models like GPT, LLaMA, etc."
+        ),
+    )
+
+    sparsity_n: int = ModeloptField(
+        default=2,
+        title="N in N:M sparsity.",
+        description=(
+            "Keep top-N of every M attention scores. Only used by triton_sparse_softmax. "
+            "Set to 0 to disable sparsity."
+        ),
+    )
+
+    sparsity_m: int = ModeloptField(
+        default=4,
+        title="M in N:M sparsity.",
+        description="Group size for N:M sparsity (4 or 8). Only used by triton_sparse_softmax.",
+    )
+
+    num_sink_tokens: int = ModeloptField(
+        default=0,
+        title="Number of sink tokens.",
+        description=(
+            "KV positions before this index are kept dense (attention sinks). "
+            "Absolute token count. Only used by triton_sparse_softmax."
+        ),
+    )
+
+    dense_window_size: int = ModeloptField(
+        default=64,
+        title="Dense window size in tokens.",
+        description=(
+            "Tokens near the query diagonal kept dense (local attention window). "
+            "Absolute token count. Default 64. Only used by triton_sparse_softmax."
+        ),
+    )
+
+    skip_softmax_threshold: float = ModeloptField(
+        default=0.1,
+        title="Skip-softmax threshold.",
+        description=(
+            "Tiles contributing less than this fraction are skipped entirely. "
+            "Only used by triton_skip_softmax. Typical values: 1e-3 to 1e-1. "
+            "Set to 0 to disable."
+        ),
+    )
+
+    skip_softmax_raw_threshold: float | None = ModeloptField(
+        default=None,
+        title="Raw skip-softmax threshold (skip_threshold_log2).",
+        description=(
+            "Raw value passed directly to the Triton kernel as skip_threshold_log2. "
+            "The kernel skips tiles where tile_row_max < row_max + raw_threshold. "
+            "Typical values are negative (e.g., -5.0). Takes precedence over "
+            "skip_softmax_threshold and calibration when set."
         ),
     )
 
@@ -104,12 +161,45 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
     @field_validator("backend")
     @classmethod
     def validate_backend(cls, v):
-        """Validate backend is pytorch."""
-        if v != "pytorch":
+        """Validate backend is pytorch or triton."""
+        if v not in ("pytorch", "triton"):
             raise ValueError(
-                f"Invalid backend: {v}. Only 'pytorch' backend is supported. "
-                f"Model must be loaded with attn_implementation='eager'."
+                f"Invalid backend: {v}. Supported backends: 'pytorch' (requires "
+                f"attn_implementation='eager'), 'triton' (requires "
+                f"attn_implementation='modelopt_triton')."
             )
+        return v
+
+    @field_validator("sparsity_m")
+    @classmethod
+    def validate_sparsity_m(cls, v):
+        """Validate sparsity_m is 4 or 8."""
+        if v not in (4, 8):
+            raise ValueError(f"sparsity_m must be 4 or 8, got {v}")
+        return v
+
+    @field_validator("sparsity_n")
+    @classmethod
+    def validate_sparsity_n(cls, v):
+        """Validate sparsity_n is non-negative."""
+        if v < 0:
+            raise ValueError(f"sparsity_n must be >= 0, got {v}")
+        return v
+
+    @field_validator("num_sink_tokens")
+    @classmethod
+    def validate_num_sink_tokens(cls, v):
+        """Validate num_sink_tokens is non-negative."""
+        if v < 0:
+            raise ValueError(f"num_sink_tokens must be >= 0, got {v}")
+        return v
+
+    @field_validator("dense_window_size")
+    @classmethod
+    def validate_dense_window_size(cls, v):
+        """Validate dense_window_size is non-negative."""
+        if v < 0:
+            raise ValueError(f"dense_window_size must be >= 0, got {v}")
         return v
 
     @field_validator("br", "bc")
@@ -120,10 +210,10 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
             raise ValueError(f"Block size must be positive, got {v}")
         return v
 
-    @field_validator("threshold")
+    @field_validator("thresholds")
     @classmethod
-    def validate_threshold(cls, v):
-        """Validate threshold is a dict with valid phases and values in range (0, 1)."""
+    def validate_thresholds(cls, v):
+        """Validate thresholds is a dict of lists with valid phases and values in range (0, 1)."""
         if not isinstance(v, dict):
             raise ValueError(
                 f"Threshold must be a dict with 'prefill' and/or 'decode' keys, got {type(v).__name__}"
@@ -135,13 +225,38 @@ class SparseAttentionAttributeConfig(ModeloptBaseConfig):
             raise ValueError(
                 f"Invalid threshold phases: {invalid_keys}. Valid phases: {valid_phases}"
             )
-        # Validate all values are in range (0, 1)
-        for phase, threshold in v.items():
-            if not isinstance(threshold, (int, float)) or threshold <= 0 or threshold >= 1:
+        # Validate all values are lists of floats in range (0, 1)
+        lengths = {}
+        for phase, threshold_list in v.items():
+            if not isinstance(threshold_list, list) or len(threshold_list) == 0:
                 raise ValueError(
-                    f"Threshold for phase '{phase}' must be in range (0, 1), got {threshold}"
+                    f"Thresholds for phase '{phase}' must be a non-empty list, got {threshold_list}"
                 )
+            for threshold in threshold_list:
+                if not isinstance(threshold, (int, float)) or threshold <= 0 or threshold >= 1:
+                    raise ValueError(
+                        f"Each threshold for phase '{phase}' must be in range (0, 1), got {threshold}"
+                    )
+            lengths[phase] = len(threshold_list)
+        # Validate prefill and decode lists have the same length
+        if len(lengths) == 2 and len(set(lengths.values())) != 1:
+            raise ValueError(
+                f"Prefill and decode threshold lists must have the same length, "
+                f"got prefill={lengths['prefill']}, decode={lengths['decode']}"
+            )
         return v
+
+    @model_validator(mode="after")
+    def validate_sparsity_n_vs_m(self):
+        """Validate sparsity_n is within the supported range for the given sparsity_m."""
+        if self.sparsity_n > 0:
+            max_n = 3 if self.sparsity_m == 4 else self.sparsity_m - 1
+            if self.sparsity_n > max_n:
+                raise ValueError(
+                    f"sparsity_n={self.sparsity_n} exceeds max for sparsity_m={self.sparsity_m}. "
+                    f"Valid range: 1..{max_n}"
+                )
+        return self
 
 
 class CalibrationConfig(ModeloptBaseConfig):
@@ -219,6 +334,15 @@ class CalibrationConfig(ModeloptBaseConfig):
             "If None, uses default: [1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, "
             "1e-2, 2e-2, 5e-2, 1e-1, 2e-1, 3e-1, 5e-1, 7e-1]. "
             "Increasing the number of trials improves calibration accuracy but slows down calibration."
+        ),
+    )
+
+    fit_logspace: bool = ModeloptField(
+        default=False,
+        title="Fit in log space",
+        description=(
+            "If True, fit the exponential model in log space (minimizes relative error). "
+            "Recommended for diffusion models where scale_factors span many orders of magnitude."
         ),
     )
 
@@ -356,7 +480,7 @@ class FlashSkipSoftmaxConfig(SparseAttentionConfig):
         default={
             "*attention*": {
                 "method": "flash_skip_softmax",
-                "threshold": {"prefill": 1e-3, "decode": 1e-5},
+                "thresholds": {"prefill": [1e-3], "decode": [1e-5]},
                 "br": 128,  # Flash Attention block rows
                 "bc": 128,  # Flash Attention block columns
                 "backend": "pytorch",  # Only pytorch backend supported
@@ -378,9 +502,9 @@ SKIP_SOFTMAX_DEFAULT = {
     "sparse_cfg": {
         "*attn*": {
             "method": "flash_skip_softmax",
-            "threshold": {
-                "prefill": 1e-3,  # More aggressive during prefill
-                "decode": 1e-4,  # Conservative during decode
+            "thresholds": {
+                "prefill": [1e-3],  # More aggressive during prefill
+                "decode": [1e-4],  # Conservative during decode
             },
             "br": 128,  # Flash Attention block rows
             "bc": 128,  # Flash Attention block columns
@@ -394,7 +518,7 @@ SKIP_SOFTMAX_DEFAULT = {
 
 
 # Configuration with RULER calibration
-# Note: threshold field is omitted - calibration determines dynamic threshold λ = a / length
+# Note: threshold field is omitted - calibration determines dynamic threshold lambda = a / length
 # The calibrated threshold adapts to sequence length for optimal sparsity
 SKIP_SOFTMAX_CALIB = {
     "sparse_cfg": {
@@ -417,13 +541,179 @@ SKIP_SOFTMAX_CALIB = {
 }
 
 
+class VSAAttributeConfig(ModeloptBaseConfig):
+    """Video Sparse Attention (VSA) attribute configuration.
+
+    VSA uses a two-branch architecture optimized for video diffusion models:
+    1. Compression branch: Block-averaged coarse attention
+    2. Sparse branch: Top-K block selection for fine-grained attention
+    """
+
+    method: str = ModeloptField(
+        default="vsa",
+        title="Sparse attention method.",
+        description="Must be 'vsa' for Video Sparse Attention.",
+    )
+
+    enable: bool = ModeloptField(
+        default=True,
+        title="Enable VSA.",
+        description="If True, enables Video Sparse Attention. If False, bypasses sparsity.",
+    )
+
+    block_size_3d: tuple[int, int, int] | list[int] = ModeloptField(
+        default=(4, 4, 4),
+        title="3D block size.",
+        description=(
+            "Video block dimensions (T, H, W) for spatial-temporal tiling. "
+            "Default (4, 4, 4) creates 64-token blocks."
+        ),
+    )
+
+    top_k_ratio: float = ModeloptField(
+        default=0.5,
+        title="Top-K selection ratio.",
+        description=(
+            "Ratio of blocks to keep in sparse branch (0.0 to 1.0). "
+            "Lower values mean more sparsity. Default 0.5 keeps 50% of blocks."
+        ),
+    )
+
+    video_shape: tuple[int, int, int] | list[int] | None = ModeloptField(
+        default=None,
+        title="Video shape.",
+        description=(
+            "Video dimensions (T, H, W) after patchification. "
+            "Required for VSA — set via config or call set_video_shape() at runtime."
+        ),
+    )
+
+    collect_stats: bool = ModeloptField(
+        default=False,
+        title="Collect statistics.",
+        description="Whether to collect sparsity statistics during forward pass.",
+    )
+
+    @field_validator("method")
+    @classmethod
+    def validate_vsa_method(cls, v):
+        """Validate method is 'vsa'."""
+        if v != "vsa":
+            raise ValueError(f"VSAAttributeConfig method must be 'vsa', got '{v}'")
+        return v
+
+    @field_validator("block_size_3d")
+    @classmethod
+    def validate_block_size_3d(cls, v):
+        """Validate 3D block size."""
+        if isinstance(v, list):
+            v = tuple(v)
+        if len(v) != 3:
+            raise ValueError(f"block_size_3d must have 3 elements (T, H, W), got {len(v)}")
+        if any(x <= 0 for x in v):
+            raise ValueError(f"All block_size_3d values must be positive, got {v}")
+        return v
+
+    @field_validator("top_k_ratio")
+    @classmethod
+    def validate_top_k_ratio(cls, v):
+        """Validate top-K ratio is in valid range."""
+        if not 0.0 < v <= 1.0:
+            raise ValueError(f"top_k_ratio must be in range (0, 1], got {v}")
+        return v
+
+    @field_validator("video_shape")
+    @classmethod
+    def validate_video_shape(cls, v):
+        """Validate video shape if provided."""
+        if v is None:
+            return v
+        if isinstance(v, list):
+            v = tuple(v)
+        if len(v) != 3:
+            raise ValueError(f"video_shape must have 3 elements (T, H, W), got {len(v)}")
+        if any(x <= 0 for x in v):
+            raise ValueError(f"All video_shape values must be positive, got {v}")
+        return v
+
+
+class VSAConfig(SparseAttentionConfig):
+    """Configuration for Video Sparse Attention optimization."""
+
+    sparse_cfg: SparseAttentionCfgType = ModeloptField(
+        default={
+            "*attn*": {
+                "method": "vsa",
+                "block_size_3d": (4, 4, 4),
+                "top_k_ratio": 0.5,
+                "enable": True,
+            },
+            "default": {"enable": False},
+        },
+        title="VSA configuration",
+        description="Pattern-based configuration for Video Sparse Attention.",
+        validate_default=True,
+    )
+
+
+# Pre-defined VSA Configuration for video diffusion models.
+# Pattern "*attn*" matches attention module names by convention.
+VSA_DEFAULT = {
+    "sparse_cfg": {
+        "*attn*": {
+            "method": "vsa",
+            "block_size_3d": (4, 4, 4),
+            "top_k_ratio": 0.5,
+            "enable": True,
+        },
+        "default": {"enable": False},
+    },
+}
+
+
+# Default N:M sparse softmax configuration
+SPARSE_SOFTMAX_DEFAULT = {
+    "sparse_cfg": {
+        "*attn*": {
+            "method": "triton_sparse_softmax",
+            "sparsity_n": 2,
+            "sparsity_m": 4,
+            "num_sink_tokens": 0,
+            "dense_window_size": 64,
+            "backend": "triton",
+            "enable": True,
+        },
+        "default": {"enable": False},
+    },
+}
+
+
+# Default skip-softmax configuration for Triton kernel
+SKIP_SOFTMAX_TRITON_DEFAULT = {
+    "sparse_cfg": {
+        "*attn*": {
+            "method": "triton_skip_softmax",
+            "skip_softmax_threshold": 0.1,
+            "backend": "triton",
+            "enable": True,
+        },
+        "default": {"enable": False},
+    },
+}
+
+
 __all__ = [
     "SKIP_SOFTMAX_CALIB",
     "SKIP_SOFTMAX_DEFAULT",
+    "SKIP_SOFTMAX_TRITON_DEFAULT",
+    "SPARSE_SOFTMAX_DEFAULT",
+    "VSA_DEFAULT",
     "CalibrationConfig",
     "FlashSkipSoftmaxConfig",
     "SparseAttentionAttributeConfig",
     "SparseAttentionCfgType",
     "SparseAttentionConfig",
     "SparseAttributeConfig",
+    "VSAAttributeConfig",
+    "VSAConfig",
 ]

@@ -81,8 +81,16 @@ with import_plugin("megatron", verbose=False):
     has_mcore = True
 
 
-def get_experts_list(module: torch.nn.Module, model_type: str):
-    """Returns list of grouped experts by linear name for given module."""
+def get_experts_list(
+    module: torch.nn.Module,
+    model_type: str,
+):
+    """Returns list of grouped experts by linear name for given module.
+
+    Args:
+        module: MoE block (e.g. MixtralSparseMoeBlock, NemotronHMOE).
+        model_type: `type(root_model).__name__.lower()` (may change after ModelOpt quantize).
+    """
     experts_list = []
 
     # Define linear layer names for different model types
@@ -98,6 +106,8 @@ def get_experts_list(module: torch.nn.Module, model_type: str):
         ]
     ):
         linear_names = ["gate_proj", "down_proj", "up_proj"]
+    elif "nemotronhforcausallm" in model_type:
+        linear_names = ["up_proj", "down_proj"]
     else:
         raise NotImplementedError(f" {model_type} not supported")
 
@@ -150,33 +160,6 @@ def check_model_compatibility(module_list: list[nn.Module]) -> tuple[bool, bool,
 
 def get_transformer_layers(model: nn.Module) -> list[nn.Module]:
     """Returns the root module of the transformer model."""
-    if "Megatron" in type(model).__name__:
-        if hasattr(model, "model") and "GPTModel" in type(model.model).__name__:
-            # NEMO mcore models can be handled with the following branch.
-            model = model.model
-
-        # NEMO non mcore models, we need to find the language_model module first.
-        children = [model]
-        language_model = None
-        while children and not language_model:
-            next_children = []
-            for child in children:
-                if type(child).__name__ == "TransformerLanguageModel":
-                    language_model = child
-                    break
-                next_children.extend(list(child.children()))
-            children = next_children
-        if language_model:
-            warn("Warning: this is an old NEMO checkpoint format and will be deprecated soon.")
-            layers = list(language_model.embedding.children()) + list(
-                language_model.encoder.children()
-            )
-
-            if hasattr(language_model, "output_layer"):
-                layers.append(language_model.output_layer)
-
-            return layers
-
     if "GPTModel" in type(model).__name__:
         # mcore models
         layers = []
@@ -332,7 +315,7 @@ def is_moe(module: nn.Module) -> bool:
     if name.endswith("sparsemoeblock") or "moelayer" in name:
         return True
     # Explicit matches for non-standard naming
-    return any(key in name for key in ["arcticmoe", "deepseekmoe", "dbrxffn"])
+    return any(key in name for key in ["arcticmoe", "deepseekmoe", "dbrxffn", "nemotronhmoe"])
 
 
 def is_quantlinear(module: nn.Module) -> bool:
@@ -385,7 +368,7 @@ def build_qkv(
         num_kv_heads = ext_config.num_kv_heads
 
         if "ColumnParallelLinear" in type(qkv_module).__name__:
-            # For NEMO model, num_kv_heads/num_attention_heads is the first dimension of QKV
+            # For Megatron-core model, num_kv_heads/num_attention_heads is the first dimension of QKV
             model_metadata_config["head_is_first_dim"] = True
 
         qkv_weight = qkv_module.weight
@@ -992,6 +975,12 @@ def get_expert_linear_names(module: nn.Module) -> list[str]:
         """
         return any(name.lower() in type(module).__name__.lower() for name in name_list)
 
+    # Structural detection: after _export_fused_experts, fused expert modules
+    # have per-expert submodules with gate_proj/up_proj/down_proj.
+    # Also handles models that originally used this naming (Qwen, DeepSeek, etc.).
+    if hasattr(module, "experts") and hasattr(module.experts, "gate_up_proj_weight_quantizers"):
+        return ["gate_up_proj", "down_proj"]
+
     if module_match_name_list(
         module,
         [
@@ -1003,13 +992,21 @@ def get_expert_linear_names(module: nn.Module) -> list[str]:
         ],
     ):
         return ["gate_proj", "down_proj", "up_proj"]
+    elif module_match_name_list(module, ["MixtralSparseMoeBlock"]):
+        # Old-style Mixtral (iterable experts) uses w1/w2/w3.
+        # Fused Mixtral (transformers 5.0+) is already handled by the
+        # structural gate_up_proj_weight_quantizers check above.
+        return ["w1", "w2", "w3"]
     elif module_match_name_list(module, ["MixtralMoeSparseMoeBlock"]):
+        # Older transformers naming for Mixtral
         return ["linear_fc1", "linear_fc2"]
     elif module_match_name_list(module, ["DBRXMoeSparseMoeBlock"]):
         return ["w1_linear", "w2_linear", "v1_linear"]
     elif module_match_name_list(module, ["GptOssMoE"]):
-        # GPT-OSS MoE modules use gate_up_proj and down_proj
         return ["gate_up_proj", "down_proj"]
+    elif module_match_name_list(module, ["NemotronHMOE"]):
+        # NemotronHMOE experts (NemotronHMLP) use up_proj and down_proj only (no gate).
+        return ["up_proj", "down_proj"]
     else:
         # assuming w1, w2, w3 by default
         return ["w1", "w2", "w3"]
@@ -1082,14 +1079,23 @@ def set_expert_quantizer_amax(
 
     target_amax = None
 
-    # Collect ANY existing amax values from current batch (most direct source)
+    # Collect ANY existing amax values from current batch (most direct source).
+    # Reduce per-quantizer amax to a scalar before stacking — quantizers in
+    # static-mode (e.g. NVFP4 with pre-computed per-block _amax) carry tensors
+    # whose shapes differ across attrs (gate_up_proj vs down_proj have different
+    # output dims), and torch.stack would otherwise fail. The result here is
+    # only used as a *fallback* scalar `target_amax` for quantizers missing
+    # amax, so a max-of-max is exactly what we want.
     valid_amax_values = []
     for _, attr_name, quantizer in all_quantizers:
         existing_amax = getattr(quantizer, "amax", None)
         if existing_amax is not None:
             # Convert to tensor and add to collection
             if isinstance(existing_amax, torch.Tensor):
-                valid_amax_values.append(existing_amax.to(target_device))
+                # Meta tensors have no storage; .amax() / .to() would fail.
+                if existing_amax.is_meta:
+                    continue
+                valid_amax_values.append(existing_amax.amax().to(target_device))
             else:
                 valid_amax_values.append(
                     torch.tensor(existing_amax, dtype=torch.float32, device=target_device)
@@ -1169,6 +1175,67 @@ def set_expert_quantizer_amax(
                 )
 
     return uncalibrated_modules
+
+
+# Gate/up naming pairs for standard (unfused) MoE architectures.
+# Fused variants (gate_up_proj, linear_fc1) already share a single quantizer and need no sync.
+_GATE_UP_PAIRS = [("gate_proj", "up_proj"), ("w1", "w3")]
+
+
+def sync_moe_gate_up_amax(model: nn.Module) -> int:
+    """Take element-wise max of gate and up weight quantizer amaxes per expert.
+
+    Serving engines fuse gate_proj and up_proj into a single gate_up_proj and
+    require a single weight_scale_2. Since weight_scale_2 = amax / (6 * 448),
+    syncing amaxes before quantization ensures the per-block weight_scale values
+    are computed against a consistent global scale.
+
+    Only affects standard MoE models with separate gate/up linear layers
+    (e.g. Qwen MoE, DeepSeek). Models with already-fused gate_up_proj
+    (e.g. Llama4, GptOss) are unaffected.
+
+    Returns:
+        Number of expert gate/up pairs whose amaxes were synced.
+    """
+    synced = 0
+    for _, sub_module in model.named_modules():
+        if not (is_moe(sub_module) and hasattr(sub_module, "experts")):
+            continue
+        if not hasattr(sub_module.experts, "__iter__"):
+            continue
+        for expert in sub_module.experts:
+            for gate_name, up_name in _GATE_UP_PAIRS:
+                gate_linear = getattr(expert, gate_name, None)
+                up_linear = getattr(expert, up_name, None)
+                if gate_linear is None or up_linear is None:
+                    continue
+                gate_wq = getattr(gate_linear, "weight_quantizer", None)
+                up_wq = getattr(up_linear, "weight_quantizer", None)
+                if gate_wq is None or up_wq is None:
+                    break
+                gate_amax = getattr(gate_wq, "amax", None)
+                up_amax = getattr(up_wq, "amax", None)
+                if gate_amax is None or up_amax is None:
+                    break
+                # Meta tensors have no storage (e.g. CPU-offloaded experts that
+                # were never activated during calibration). Skip — there is no
+                # real amax data to sync.
+                if gate_amax.is_meta or up_amax.is_meta:
+                    warn(
+                        f"Skipping gate/up amax sync for expert with meta tensors "
+                        f"(gate_amax.is_meta={gate_amax.is_meta}, "
+                        f"up_amax.is_meta={up_amax.is_meta}). "
+                        f"This typically means the expert was CPU-offloaded and "
+                        f"not activated during calibration."
+                    )
+                    break
+                if not torch.equal(gate_amax, up_amax):
+                    shared_amax = torch.max(gate_amax, up_amax)
+                    gate_wq.amax = shared_amax
+                    up_wq.amax = shared_amax.clone()
+                    synced += 1
+                break
+    return synced
 
 
 def build_stacked_experts(
@@ -1433,7 +1500,7 @@ def _set_layer_config_from_metaconfig(layer_config, metaconfig):
             if k in metaconfig:
                 setattr(layer_config, name, metaconfig[k])
 
-    # MCore / NeMo use "rope" as an alias for "rope_gpt_neox"
+    # MCore use "rope" as an alias for "rope_gpt_neox"
     if layer_config.position_embedding_type == "rope":
         layer_config.position_embedding_type = "rope_gpt_neox"
 

@@ -45,7 +45,6 @@ class SparseAttentionStatsManager:
         self.aggregated_stats: dict = {
             "total_calls": 0,
             "total_blocks": 0,
-            "sparse_blocks": 0,
             "phase_counts": {"prefill": 0, "decode": 0, "unknown": 0},
         }
 
@@ -66,7 +65,14 @@ class SparseAttentionStatsManager:
         # Update aggregated stats
         self.aggregated_stats["total_calls"] += 1
         self.aggregated_stats["total_blocks"] += stats.get("total_blocks", 0)
-        self.aggregated_stats["sparse_blocks"] += stats.get("sparse_blocks", 0)
+
+        incoming = stats.get("sparse_blocks")
+        if incoming is not None:
+            if "sparse_blocks" not in self.aggregated_stats:
+                self.aggregated_stats["sparse_blocks"] = list(incoming)
+            else:
+                for i, val in enumerate(incoming):
+                    self.aggregated_stats["sparse_blocks"][i] += val
 
         phase = stats.get("phase", "unknown")
         if phase in self.aggregated_stats["phase_counts"]:
@@ -74,14 +80,15 @@ class SparseAttentionStatsManager:
 
         # In calibration mode, store per-sample stats
         if self.calibration_mode:
-            self.per_sample_stats.append(
-                {
-                    "module": self.module_name,
-                    "sparsity": stats.get("sparsity", 0.0),
-                    "sample_length": stats.get("sample_length", 0),
-                    "phase": phase,
-                }
-            )
+            sample_stat = {
+                "module": self.module_name,
+                "sparsity": stats.get("sparsity", 0.0),
+                "sample_length": stats.get("sample_length", 0),
+                "phase": phase,
+            }
+            if "normalized_gaps" in stats:
+                sample_stat["normalized_gaps"] = stats["normalized_gaps"]
+            self.per_sample_stats.append(sample_stat)
 
     def get_summary(self) -> dict:
         """Get aggregated statistics summary.
@@ -91,10 +98,15 @@ class SparseAttentionStatsManager:
             and phase distribution.
         """
         total_blocks = self.aggregated_stats["total_blocks"]
-        if total_blocks > 0:
-            avg_sparsity = self.aggregated_stats["sparse_blocks"] / total_blocks
+        sparse_blocks = self.aggregated_stats.get("sparse_blocks")
+        if sparse_blocks is not None:
+            avg_sparsity = (
+                [sb / total_blocks for sb in sparse_blocks]
+                if total_blocks > 0
+                else [0.0] * len(sparse_blocks)
+            )
         else:
-            avg_sparsity = 0.0
+            avg_sparsity = []
 
         return {
             "module": self.module_name,
@@ -122,7 +134,6 @@ class SparseAttentionStatsManager:
         self.aggregated_stats = {
             "total_calls": 0,
             "total_blocks": 0,
-            "sparse_blocks": 0,
             "phase_counts": {"prefill": 0, "decode": 0, "unknown": 0},
         }
         self.per_sample_stats = []

@@ -17,10 +17,14 @@
 
 import copy
 import json
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from warnings import warn
 
+import requests
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -48,9 +52,9 @@ SUPPORTED_DATASET_CONFIG: dict[str, Any] = {
             "name": "SFT",
             "split": ["code", "math", "science", "chat", "safety"],
         },
-        "preprocess": lambda sample: "\n".join(turn["content"] for turn in sample["input"])
-        + "\n"
-        + sample["output"],
+        "preprocess": lambda sample: (
+            "\n".join(turn["content"] for turn in sample["input"]) + "\n" + sample["output"]
+        ),
     },
     "nemotron-post-training-dataset-v2": {
         "config": {
@@ -104,14 +108,16 @@ SUPPORTED_DATASET_CONFIG: dict[str, Any] = {
 
 __all__ = [
     "create_forward_loop",
+    "download_hf_dataset_as_jsonl",
     "get_dataset_dataloader",
     "get_dataset_samples",
+    "get_jsonl_text_samples",
     "get_max_batch_size",
     "get_supported_datasets",
 ]
 
 
-def _get_jsonl_text_samples(jsonl_path: str, num_samples: int) -> list[str]:
+def get_jsonl_text_samples(jsonl_path: str, num_samples: int, key: str = "text") -> list[str]:
     """Load up to ``num_samples`` entries from a JSONL file using the ``text`` field.
 
     Each non-empty line must be a JSON object containing a ``text`` field.
@@ -142,12 +148,12 @@ def _get_jsonl_text_samples(jsonl_path: str, num_samples: int) -> list[str]:
                     f"got {type(obj)}."
                 )
 
-            if "text" not in obj:
+            if key not in obj:
                 raise ValueError(
-                    f"Missing required field 'text' in JSONL file {jsonl_path} at line {line_idx}."
+                    f"Missing required field '{key}' in JSONL file {jsonl_path} at line {line_idx}."
                 )
 
-            samples.append(str(obj["text"]))
+            samples.append(str(obj[key]))
 
     return samples
 
@@ -158,9 +164,7 @@ def _normalize_splits(split: str | list[str]) -> list[str]:
 
 
 def _auto_preprocess_sample(
-    sample: dict,
-    dataset_name: str,
-    tokenizer: "PreTrainedTokenizerBase | None" = None,
+    sample: dict, dataset_name: str, tokenizer: "PreTrainedTokenizerBase | None" = None
 ) -> str:
     """Auto-detect dataset format and preprocess a single sample based on column conventions.
 
@@ -223,7 +227,10 @@ def get_dataset_samples(
     ``messages``/``conversations`` (chat), ``prompt``, ``text``, or ``input``.
 
     Args:
-        dataset_name: Name or HuggingFace path of the dataset to load, or a path to a ``.jsonl``/``.jsonl.gz`` file.
+        dataset_name: Name or HuggingFace path of the dataset to load, a local directory path,
+            or a path to a ``.jsonl`` file.  For local directory paths, the
+            predefined config from ``SUPPORTED_DATASET_CONFIG`` is matched if the base folder name
+            matches a registered key (e.g. ``/hf-local/abisee/cnn_dailymail`` matches ``cnn_dailymail`` key).
         num_samples: Number of samples to load from the dataset.
         apply_chat_template: Whether to apply the chat template to the samples
             (if supported by the dataset).  For unregistered datasets with a
@@ -240,15 +247,22 @@ def get_dataset_samples(
     """
     # Local JSONL file path support (each line is a JSON object with a `text` field).
     if dataset_name.endswith(".jsonl"):
-        return _get_jsonl_text_samples(dataset_name, num_samples)
+        return get_jsonl_text_samples(dataset_name, num_samples, key="text")
 
     from datasets import load_dataset
+
+    local_dataset_path = None
+    if os.path.exists(dataset_name):  # Local path
+        local_dataset_path = dataset_name
+        dataset_name = os.path.basename(os.path.normpath(local_dataset_path))
 
     is_registered = dataset_name in SUPPORTED_DATASET_CONFIG
 
     if is_registered:
         dataset_config = SUPPORTED_DATASET_CONFIG[dataset_name]
         config = dataset_config["config"].copy()
+        if local_dataset_path:
+            config["path"] = local_dataset_path
         splits = _normalize_splits(split) if split is not None else config.pop("split", [None])
         if split is not None:
             config.pop("split", None)
@@ -274,17 +288,18 @@ def get_dataset_samples(
             return dataset_config["preprocess"](sample)
 
     else:
-        warn(
+        print(
             f"Dataset '{dataset_name}' is not in SUPPORTED_DATASET_CONFIG. "
             "Auto-detecting format from column names."
         )
-        config = {"path": dataset_name}
+        config = {"path": local_dataset_path or dataset_name}
         splits = _normalize_splits(split) if split is not None else ["train"]
 
         def _preprocess(sample: dict) -> str:
             return _auto_preprocess_sample(sample, dataset_name, tokenizer)
 
     # load_dataset does not support a list of splits while streaming, so load each separately.
+    print(f"Loading dataset with {config=} and {splits=}")
     dataset_splits = [load_dataset(streaming=True, **config, split=s) for s in splits]
 
     num_per_split = [num_samples // len(dataset_splits)] * len(dataset_splits)
@@ -391,8 +406,15 @@ def get_dataset_dataloader(
         )
         tokenized_dataset = _CustomDataset(batch_encoded)
     else:
-        # For backward compatibility, if labels are not needed, we only return the input_ids.
-        tokenized_dataset = _CustomDataset({"input_ids": batch_encoded["input_ids"]})
+        # Always include attention_mask so the model correctly ignores padding tokens
+        # during calibration. Without it, HF models create a full causal mask and
+        # padding tokens participate in attention, skewing calibration statistics.
+        tokenized_dataset = _CustomDataset(
+            {
+                "input_ids": batch_encoded["input_ids"],
+                "attention_mask": batch_encoded["attention_mask"],
+            }
+        )
 
     calib_dataloader = DataLoader(tokenized_dataset, batch_size=batch_size, shuffle=False)
 
@@ -414,6 +436,36 @@ def get_supported_datasets() -> list[str]:
             print("Supported datasets:", get_supported_datasets())
     """
     return list(SUPPORTED_DATASET_CONFIG.keys())
+
+
+@contextmanager
+def _disable_use_cache(model: torch.nn.Module) -> Iterator[None]:
+    """Set ``model.config.use_cache = False`` for the duration of the block.
+
+    KV caching is unwanted during calibration / memory-probe forward passes:
+    it wastes memory, and for hybrid Mamba/attention models (e.g., NemotronH)
+    the cache state is mutated in-place and breaks correctness. Setting
+    ``use_cache`` unconditionally (rather than only when it was already
+    present) also sidesteps configs that never assign the attribute at all
+    — e.g., ``Step3p5Config`` from stepfun-ai/Step-3.5-Flash — where forward
+    code that reads ``self.config.use_cache`` would otherwise raise
+    ``AttributeError``. The prior value is restored on exit if one existed.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        yield
+        return
+    had_attr = hasattr(config, "use_cache")
+    prev = config.use_cache if had_attr else None
+    config.use_cache = False
+    try:
+        yield
+    finally:
+        if had_attr:
+            config.use_cache = prev
+        else:
+            with suppress(AttributeError):
+                delattr(config, "use_cache")
 
 
 def get_max_batch_size(
@@ -446,42 +498,49 @@ def get_max_batch_size(
             torch.ones([1, max_sample_length], dtype=torch.int32, device=model.device) * 100
         )
 
-    # Calculate single batch inference with dummy input.
-    with torch.set_grad_enabled(enable_grad):
-        infer_method(sample_input_single_batch)
-    free_mem_after, max_allocated_after = _get_free_gpu_mem()
-
-    mem_diff_per_data_batch = (
-        max(
-            (free_mem_before - free_mem_after),
-            (max_allocated_after - max_allocated_before),
-        )
-        * sample_memory_usage_ratio
-    )
-    if mem_diff_per_data_batch <= 0:
-        print(
-            "Warning: No measurable memory usage found for a single batch. "
-            "Falling back to batch_size=1."
-        )
-        target_data_batch = 1
-    else:
-        target_data_batch = max(int(free_mem_before / mem_diff_per_data_batch), 1)
-    target_input = sample_input_single_batch.expand(
-        [
-            target_data_batch if index == 0 else dim
-            for index, dim in enumerate(sample_input_single_batch.shape)
-        ]
-    )
-
-    # For some models on multi GPU, we observe the memory per batch is not a constant.
-    # So we just test the target batch size and make sure we do not go OOM.
-    while target_data_batch > 1:
+    with _disable_use_cache(model):
+        # Calculate single batch inference with dummy input.
         with torch.set_grad_enabled(enable_grad):
-            try:
-                infer_method(target_input)
-                break
-            except torch.cuda.OutOfMemoryError:
-                target_data_batch = target_data_batch // 2
+            infer_method(sample_input_single_batch)
+        free_mem_after, max_allocated_after = _get_free_gpu_mem()
+
+        mem_diff_per_data_batch = (
+            max(
+                (free_mem_before - free_mem_after),
+                (max_allocated_after - max_allocated_before),
+            )
+            * sample_memory_usage_ratio
+        )
+        if mem_diff_per_data_batch <= 0:  # pragma: no cover - GPU memory probe edge case
+            print(  # pragma: no cover
+                "Warning: No measurable memory usage found for a single batch. "
+                "Falling back to batch_size=1."
+            )
+            target_data_batch = 1  # pragma: no cover
+        else:
+            target_data_batch = max(int(free_mem_before / mem_diff_per_data_batch), 1)
+
+        def _expand_to(batch: int) -> torch.Tensor:
+            return sample_input_single_batch.expand(
+                [
+                    batch if index == 0 else dim
+                    for index, dim in enumerate(sample_input_single_batch.shape)
+                ]
+            )
+
+        target_input = _expand_to(target_data_batch)
+
+        # For some models on multi GPU, we observe the memory per batch is not a constant.
+        # So we just test the target batch size and make sure we do not go OOM.
+        while target_data_batch > 1:
+            with torch.set_grad_enabled(enable_grad):
+                try:
+                    infer_method(target_input)
+                    break
+                except torch.cuda.OutOfMemoryError:  # pragma: no cover - GPU OOM retry path
+                    target_data_batch = target_data_batch // 2  # pragma: no cover
+                    target_input = _expand_to(target_data_batch)  # pragma: no cover
+                    torch.cuda.empty_cache()  # pragma: no cover
 
     # Regulate the data batch target to be 1, 2, 4, 8, 12, ..., capped at 64
     if target_data_batch < 2:
@@ -494,20 +553,25 @@ def get_max_batch_size(
         return 512
 
 
-def _process_batch(batch_data, infer_method, max_working_batch_size=None):
+def _process_batch(
+    batch_data, infer_method, max_working_batch_size=None, allowed_non_tensor_keys=None
+):
     """Process a batch of data through the model's inference method.
 
     Args:
         batch_data: Dictionary containing the batch data
         infer_method: Model's inference method (either forward or generate)
         max_working_batch_size: Maximum batch size known to work without OOM
+        allowed_non_tensor_keys: Set of key names whose values may be non-tensor types
 
     Returns:
         The maximum batch size that worked successfully
     """
-    assert all(torch.is_tensor(data) or data is None for data in batch_data.values()), (
-        "batch_data values must be tensors"
-    )
+    allowed_non_tensor_keys = allowed_non_tensor_keys or set()
+    assert all(
+        torch.is_tensor(data) or data is None or key in allowed_non_tensor_keys
+        for key, data in batch_data.items()
+    ), f"batch_data values must be tensors or None, except for keys: {allowed_non_tensor_keys}."
     # Get the batch size of current data
     batch_size = batch_data[next(iter(batch_data.keys()))].shape[0]
 
@@ -524,7 +588,7 @@ def _process_batch(batch_data, infer_method, max_working_batch_size=None):
                     split_data[key] = batch_data[key][i:end_idx, ...]
 
             max_working_batch_size = _process_batch(
-                split_data, infer_method, max_working_batch_size
+                split_data, infer_method, max_working_batch_size, allowed_non_tensor_keys
             )
 
         return max_working_batch_size
@@ -552,28 +616,39 @@ def _process_batch(batch_data, infer_method, max_working_batch_size=None):
     split_data_2 = {key: batch_data[key][mid:, ...] for key in batch_data}
 
     # Recursively process each half and track max working batch size
-    max_working_batch_size = _process_batch(split_data_1, infer_method)
-    max_working_batch_size = _process_batch(split_data_2, infer_method, max_working_batch_size)
+    max_working_batch_size = _process_batch(
+        split_data_1, infer_method, allowed_non_tensor_keys=allowed_non_tensor_keys
+    )
+    max_working_batch_size = _process_batch(
+        split_data_2, infer_method, max_working_batch_size, allowed_non_tensor_keys
+    )
 
     # Return the minimum of the two (to be conservative)
     return max_working_batch_size
 
 
-def _forward_loop(model: torch.nn.Module, dataloader: DataLoader) -> None:
+def _forward_loop(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    allowed_non_tensor_keys: set | None = None,
+) -> None:
     """Runs forward passes through the model using data from the dataloader.
 
     Args:
         model: The PyTorch model to run inference on
         dataloader: DataLoader containing the batched input data
+        allowed_non_tensor_keys: Set of key names whose values may be non-tensor types
     """
-    with torch.no_grad():
+    with _disable_use_cache(model), torch.no_grad():
         is_enc_dec = model_type_is_enc_dec(model)
         infer_method = model.generate if is_enc_dec else model.forward
         max_working_batch_size = None  # Initialize max working batch size as None
 
         for _, data in enumerate(tqdm(dataloader)):
             # Process batch and update max working batch size
-            max_working_batch_size = _process_batch(data, infer_method, max_working_batch_size)
+            max_working_batch_size = _process_batch(
+                data, infer_method, max_working_batch_size, allowed_non_tensor_keys
+            )
 
 
 def create_forward_loop(
@@ -586,6 +661,7 @@ def create_forward_loop(
     device: str | None = None,
     include_labels: bool = False,
     dataloader: DataLoader | None = None,
+    allowed_non_tensor_keys: set | None = None,
 ) -> Callable:
     """Creates and returns a forward loop function configured for a specific model, dataset, and tokenizer.
 
@@ -604,6 +680,9 @@ def create_forward_loop(
         device: Target device for the returned dataloader.
         include_labels: Whether to include labels in the dataloader.
         dataloader: If provided, use the provided dataloader instead.
+        allowed_non_tensor_keys: Set of key names whose batch values may be non-tensor types.
+            Useful when the dataloader yields batches with non-standard fields (e.g., nested
+            model outputs).
 
     Example usage for quantization:
 
@@ -643,9 +722,95 @@ def create_forward_loop(
             include_labels=include_labels,
         )
 
-    return lambda model: _forward_loop(model, dataloader)
+    return lambda model: _forward_loop(model, dataloader, allowed_non_tensor_keys)
 
 
 def model_type_is_enc_dec(model):
     enc_dec_model_list = ["t5", "bart", "whisper"]
     return any(model_name in model.__class__.__name__.lower() for model_name in enc_dec_model_list)
+
+
+def download_hf_dataset_as_jsonl(
+    dataset_name: str,
+    output_dir: str | Path,
+    json_keys: str | list[str] = ["text"],
+    name: str | None = None,
+    split: str | None = None,
+    max_samples_per_split: int | None = None,
+    num_proc: int | None = None,
+) -> list[str]:
+    """Download a Hugging Face dataset and save as JSONL files.
+
+    Args:
+        dataset_name: Name or HuggingFace path of the dataset to download
+        output_dir: Directory to save the JSONL files
+        json_keys: Key or list of keys to extract from the dataset. Defaults to ["text"].
+        name: Name of the subset to download
+        split: Split of the dataset to download. Defaults to None (all splits).
+        max_samples_per_split: Maximum number of samples to download per split. Defaults to None.
+        num_proc: Number of processes to use for parallel processing. Defaults to None.
+
+    Returns:
+        List of paths to downloaded JSONL files.
+    """
+    from datasets import load_dataset
+    from huggingface_hub.utils import build_hf_headers
+
+    print(f"Downloading dataset {dataset_name} from Hugging Face")
+    if isinstance(json_keys, str):
+        json_keys = [json_keys]
+    jsonl_paths: list[str] = []
+
+    try:
+        response = requests.get(
+            f"https://datasets-server.huggingface.co/splits?dataset={dataset_name}",
+            headers=build_hf_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"Failed to fetch dataset splits for {dataset_name}: {e}") from e
+
+    response_json = response.json()
+    print(f"\nFound {len(response_json['splits'])} total splits for {dataset_name}:")
+    for entry in response_json["splits"]:
+        print(f"\t{entry}")
+
+    splits_to_process = []
+    for entry in response_json["splits"]:
+        if name is not None and name != entry.get("config", None):
+            continue
+        if split is not None and split != entry["split"]:
+            continue
+        splits_to_process.append(entry)
+
+    print(f"\nFound {len(splits_to_process)} splits to process:")
+    for entry in splits_to_process:
+        print(f"\t{entry}")
+
+    for entry in splits_to_process:
+        path = entry["dataset"]
+        name = entry.get("config", None)
+        split = entry["split"]
+        if max_samples_per_split is not None:
+            split = f"{split}[:{max_samples_per_split}]"
+        jsonl_file_path = f"{output_dir}/{path.replace('/', '--')}_{name}_{split}.jsonl"
+
+        print(f"\nLoading HF dataset {path=}, {name=}, {split=}")
+        if os.path.exists(jsonl_file_path):
+            jsonl_paths.append(jsonl_file_path)
+            print(f"\t[SKIP] Raw dataset {jsonl_file_path} already exists")
+            continue
+        ds = load_dataset(path=path, name=name, split=split)
+
+        for key in json_keys:
+            if key not in ds.features:
+                raise KeyError(
+                    f"{key=} not found in dataset features. Available: {list(ds.features)}"
+                )
+
+        print(f"Saving raw dataset to {jsonl_file_path}")
+        ds.to_json(jsonl_file_path, num_proc=num_proc)
+        jsonl_paths.append(jsonl_file_path)
+
+    return jsonl_paths

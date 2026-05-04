@@ -25,10 +25,17 @@ from diffusers import (
     StableDiffusion3Pipeline,
     WanPipeline,
 )
+
+try:
+    from diffusers import Flux2Pipeline
+except ImportError:
+    Flux2Pipeline = None
 from utils import (
     filter_func_default,
     filter_func_flux_dev,
+    filter_func_ltx2_vae,
     filter_func_ltx_video,
+    filter_func_wan_vae,
     filter_func_wan_video,
 )
 
@@ -42,36 +49,37 @@ class ModelType(str, Enum):
     SD35_MEDIUM = "sd3.5-medium"
     FLUX_DEV = "flux-dev"
     FLUX_SCHNELL = "flux-schnell"
+    FLUX2_DEV = "flux2-dev"
     LTX_VIDEO_DEV = "ltx-video-dev"
     LTX2 = "ltx-2"
     WAN22_T2V_14b = "wan2.2-t2v-14b"
     WAN22_T2V_5b = "wan2.2-t2v-5b"
 
 
-def get_model_filter_func(model_type: ModelType) -> Callable[[str], bool]:
-    """
-    Get the appropriate filter function for a given model type.
+_FILTER_FUNC_MAP: dict[ModelType, Callable[[str], bool]] = {
+    ModelType.FLUX_DEV: filter_func_flux_dev,
+    ModelType.FLUX2_DEV: filter_func_flux_dev,
+    ModelType.LTX_VIDEO_DEV: filter_func_ltx_video,
+    ModelType.LTX2: filter_func_ltx_video,
+    ModelType.WAN22_T2V_14b: filter_func_wan_video,
+    ModelType.WAN22_T2V_5b: filter_func_wan_video,
+}
 
-    Args:
-        model_type: The model type enum
+_VAE_FILTER_FUNC_MAP: dict[tuple[ModelType, str], Callable[[str], bool]] = {
+    (ModelType.LTX2, "video_decoder"): filter_func_ltx2_vae,
+    (ModelType.WAN22_T2V_14b, "vae"): filter_func_wan_vae,
+    (ModelType.WAN22_T2V_5b, "vae"): filter_func_wan_vae,
+}
 
-    Returns:
-        A filter function appropriate for the model type
-    """
-    filter_func_map = {
-        ModelType.FLUX_DEV: filter_func_flux_dev,
-        ModelType.FLUX_SCHNELL: filter_func_default,
-        ModelType.SDXL_BASE: filter_func_default,
-        ModelType.SDXL_TURBO: filter_func_default,
-        ModelType.SD3_MEDIUM: filter_func_default,
-        ModelType.SD35_MEDIUM: filter_func_default,
-        ModelType.LTX_VIDEO_DEV: filter_func_ltx_video,
-        ModelType.LTX2: filter_func_ltx_video,
-        ModelType.WAN22_T2V_14b: filter_func_wan_video,
-        ModelType.WAN22_T2V_5b: filter_func_wan_video,
-    }
 
-    return filter_func_map.get(model_type, filter_func_default)
+def get_model_filter_func(
+    model_type: ModelType, backbone_name: str = "transformer"
+) -> Callable[[str], bool]:
+    """Get the appropriate filter function for a given model type and backbone."""
+    vae_func = _VAE_FILTER_FUNC_MAP.get((model_type, backbone_name))
+    if vae_func is not None:
+        return vae_func
+    return _FILTER_FUNC_MAP.get(model_type, filter_func_default)
 
 
 # Model registry with HuggingFace model IDs
@@ -82,6 +90,7 @@ MODEL_REGISTRY: dict[ModelType, str] = {
     ModelType.SD35_MEDIUM: "stabilityai/stable-diffusion-3.5-medium",
     ModelType.FLUX_DEV: "black-forest-labs/FLUX.1-dev",
     ModelType.FLUX_SCHNELL: "black-forest-labs/FLUX.1-schnell",
+    ModelType.FLUX2_DEV: "black-forest-labs/FLUX.2-dev",
     ModelType.LTX_VIDEO_DEV: "Lightricks/LTX-Video-0.9.7-dev",
     ModelType.LTX2: "Lightricks/LTX-2",
     ModelType.WAN22_T2V_14b: "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
@@ -95,6 +104,7 @@ MODEL_PIPELINE: dict[ModelType, type[DiffusionPipeline] | None] = {
     ModelType.SD35_MEDIUM: StableDiffusion3Pipeline,
     ModelType.FLUX_DEV: FluxPipeline,
     ModelType.FLUX_SCHNELL: FluxPipeline,
+    ModelType.FLUX2_DEV: Flux2Pipeline,
     ModelType.LTX_VIDEO_DEV: LTXConditionPipeline,
     ModelType.LTX2: None,
     ModelType.WAN22_T2V_14b: WanPipeline,
@@ -149,9 +159,18 @@ MODEL_DEFAULTS: dict[ModelType, dict[str, Any]] = {
     ModelType.SD35_MEDIUM: _SD3_BASE_CONFIG,
     ModelType.FLUX_DEV: _FLUX_BASE_CONFIG,
     ModelType.FLUX_SCHNELL: _FLUX_BASE_CONFIG,
-    ModelType.LTX_VIDEO_DEV: {
+    ModelType.FLUX2_DEV: {
         "backbone": "transformer",
         "dataset": _SD_PROMPTS_DATASET,
+        "inference_extra_args": {
+            "height": 768,
+            "width": 1024,
+            "guidance_scale": 4.0,
+        },
+    },
+    ModelType.LTX_VIDEO_DEV: {
+        "backbone": "transformer",
+        "dataset": _OPENVID_DATASET,
         "inference_extra_args": {
             "height": 512,
             "width": 704,
@@ -161,7 +180,7 @@ MODEL_DEFAULTS: dict[ModelType, dict[str, Any]] = {
     },
     ModelType.LTX2: {
         "backbone": "transformer",
-        "dataset": _SD_PROMPTS_DATASET,
+        "dataset": _OPENVID_DATASET,
         "inference_extra_args": {
             "height": 768,
             "width": 1280,

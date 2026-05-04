@@ -18,7 +18,12 @@ import re
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Type
 
-from modelopt.torch.nas.plugins.megatron_hooks.base_hooks import ForwardHook
+from modelopt.torch.prune.importance_hooks.base_hooks import ForwardHook
+
+__all__ = [
+    "LayerDescriptor",
+    "PruningMixIn",
+]
 
 
 class LayerDescriptor:

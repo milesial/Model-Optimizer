@@ -324,6 +324,78 @@ def get_tensor_consumer_node_indices(graph: onnx.GraphProto | gs.Graph) -> dict[
     return tensor_consumer_map
 
 
+def _is_following_cask_partition(
+    node: Node, cask_partition_nodes: set[str], max_depth: int = 10
+) -> bool:
+    """Check if a CASK fusible partition can be reached by traversing backward through copy ops.
+
+    Args:
+        node: The node to check.
+        cask_partition_nodes: Set of node names belonging to CASK partitions.
+        max_depth: Maximum recursion depth to guard against pathological graphs.
+
+    Returns:
+        True if the node belongs to or follows a CASK partition through copy ops.
+    """
+    if node.name in cask_partition_nodes:
+        return True
+
+    if max_depth <= 0 or not is_copy_op(node.op):
+        return False
+
+    parent_nodes = get_parent_nodes(node)
+    if len(parent_nodes) == 0:
+        return False
+
+    return all(
+        _is_following_cask_partition(parent, cask_partition_nodes, max_depth - 1)
+        for parent in parent_nodes
+    )
+
+
+def find_conv_to_layernorm_nodes(
+    graph: Graph,
+    cask_fusible_partitions: list[list[Node]],
+) -> list[Node]:
+    """Find LayerNormalization nodes whose input comes from a CASK (Conv) partition.
+
+    When a Conv's output feeds into a LayerNormalization, the Conv output should be
+    quantized to enable faster INT8 kernels in TRT. This function detects such patterns
+    and returns the LayerNormalization nodes that should be added to the quantizable
+    nodes list so that Q/DQ pairs are inserted on their input (i.e. the Conv output).
+
+    Args:
+        graph: ONNX model graph.
+        cask_fusible_partitions: List of CASK fusible partitions.
+
+    Returns:
+        List of LayerNormalization nodes that consume CASK partition outputs.
+    """
+    cask_partition_nodes: set[str] = set()
+    for partition in cask_fusible_partitions:
+        cask_partition_nodes.update(node.name for node in partition)
+
+    conv_to_ln_nodes = []
+    for node in graph.nodes:
+        if node.op != "LayerNormalization":
+            continue
+
+        # Check if the first input (activation) comes from a CASK partition
+        # possibly through copy ops (Reshape, Transpose, etc.)
+        inp_tensor = node.inputs[0]
+        if inp_tensor.inputs:
+            producer = inp_tensor.inputs[0]
+            if _is_following_cask_partition(producer, cask_partition_nodes):
+                conv_to_ln_nodes.append(node)
+                logger.debug(
+                    f"Found Conv->LayerNorm pattern: LayerNorm node '{node.name}' "
+                    f"consumes CASK partition output"
+                )
+
+    logger.info(f"Found {len(conv_to_ln_nodes)} Conv->LayerNorm patterns to quantize")
+    return conv_to_ln_nodes
+
+
 def filter_quantizable_kgen_heads(
     cask_fusible_partitions: list[list[Node]],
     kgen_partitions: list[list[Node]],
@@ -331,26 +403,11 @@ def filter_quantizable_kgen_heads(
     graph: Graph,
 ) -> tuple[list[Node], list[tuple[Node, Node, str]]]:
     """Returns the list of kgen head names if it follows a CASK partition."""
-    cask_partition_nodes = set()
+    cask_partition_nodes: set[str] = set()
     for partition in cask_fusible_partitions:
-        cask_partition_nodes.update([node.name for node in partition])
+        cask_partition_nodes.update(node.name for node in partition)
 
     cask_partition_heads = [partition[0] for partition in cask_fusible_partitions]
-
-    def _is_following_cask_partition(node: Node):
-        # Checking if cask fusible partition can be reached backward
-        # ignoring the copy ops
-        if node.name in cask_partition_nodes:
-            return True
-
-        if not is_copy_op(node.op):
-            return False
-
-        parent_nodes = get_parent_nodes(node)
-        if len(parent_nodes) == 0:
-            return False
-
-        return all(_is_following_cask_partition(parent) for parent in parent_nodes)
 
     def _is_mha_epilogue_pattern(node: Node, graph: Graph):
         if head_node.op != "Add":
@@ -422,7 +479,10 @@ def filter_quantizable_kgen_heads(
         # and decide which input of kgen head needs quantization
         for parent in head_parents:
             # If the head is consuming output of any quantizable op, then it is quantizable
-            if _is_following_cask_partition(parent) or parent.op in output_quantization_candidates:
+            if (
+                _is_following_cask_partition(parent, cask_partition_nodes)
+                or parent.op in output_quantization_candidates
+            ):
                 # The mask add of MHA should not be quantized
                 if _is_mha_epilogue_pattern(head_node, graph):
                     no_quantize_inputs_of_head.append(
@@ -616,16 +676,37 @@ def remove_partial_input_qdq(
             # Reached end of the graph
             continue
         if dq_node.op == "DequantizeLinear":
-            dq_node = dq_node.outputs[0]  # source_node->Q->DQ->target_node0
+            dq_output = dq_node.outputs[0]  # source_node->Q->DQ->target_node
 
-            # Find the input index in the target connecting with source_node
+            # Look up the specific target node in the quantized graph.
+            # With DedicatedQDQPair=False, a shared Q/DQ pair may feed multiple consumers
+            # (e.g. Conv activation AND Add residual). Always patch the intended target
+            # rather than the first consumer of the DQ output to avoid removing Q/DQ from
+            # the wrong branch.
+            target_node_in_graph = graph_nodes.get(target.name)
+            if target_node_in_graph is None:
+                continue
+
+            # Find the input index in the target that is connected to the DQ output
             target_input_idx_arr = [
-                idx for idx, inp in enumerate(dq_node.outputs[0].inputs) if inp.name == dq_node.name
+                idx
+                for idx, inp in enumerate(target_node_in_graph.inputs)
+                if inp.name == dq_output.name
             ]
-            target_input_idx = target_input_idx_arr[0] if target_input_idx_arr else 0
+            # If no input index is found (dq_output is not actually connected to target node), skip rewiring to
+            # prevent silent corruption of the graph.
+            if not target_input_idx_arr:
+                logger.warning(
+                    "Expected DequantizeLinear output '%s' to be an input of node '%s', "
+                    "but no matching input was found. Skipping Q/DQ bypass for this edge.",
+                    dq_output.name,
+                    target_node_in_graph.name,
+                )
+                continue
+            target_input_idx = target_input_idx_arr[0]
 
-            # Connect the output of source_node with the output of DQ
-            dq_node.outputs[0].inputs[target_input_idx] = source_node.outputs[0]
+            # Connect the target's input directly to source_node's output (bypass Q/DQ)
+            target_node_in_graph.inputs[target_input_idx] = source_node.outputs[0]
 
     # Check for quantized residual Adds where the parallel branch is not being quantized
     for source, target, non_qdq_input_name in no_quantize_inputs:
@@ -1008,11 +1089,14 @@ def find_nodes_from_matmul_to_exclude(
     calibration_eps: list[str] = ["cpu", "cuda:0", "trt"],
     calibration_shapes: str | dict | None = None,
 ) -> list[str]:
-    """Find MatMul nodes that meets gemv condition to exclude.
+    """Find MatMul nodes that meet gemv or small-gemm conditions and should be excluded.
 
-    Either of m or n in matmul is 1, this matmul cannot utilize
-    TensorCores. The perf of adding Q/DQ layers is not good in
-    TRT. Thus, in this case, do not add Q/DQ layers to this matmul.
+    A MatMul is excluded if either:
+
+    - m or n in the output is 1 (GEMV): cannot utilize TensorCores; or
+    - K or N is smaller than ``_MIN_MATMUL_DIM`` (16): both INT8 and FP8 Tensor Core
+      kernels need K/N >= 16 to be efficient, and adding Q/DQ layers on such small
+      GEMMs causes TRT perf regressions.
 
     Args:
         onnx_path: Path to the onnx model.
@@ -1061,12 +1145,21 @@ def find_nodes_from_matmul_to_exclude(
     return [*set(nodes_to_exclude)]
 
 
+_MIN_CHANNELS_FP8 = 16
+# Minimum K/N dim for MatMul/Gemm under INT8 or FP8 quantization. Both INT8 and FP8
+# Tensor Core kernels need K/N >= 16 to be efficient; adding Q/DQ layers on smaller
+# GEMMs causes TRT perf regressions.
+_MIN_MATMUL_DIM = 16
+
+
 def find_nodes_from_convs_to_exclude(graph: Graph, quantize_mode: str = "int8"):
     """Find unsupported Conv nodes to exclude from quantization.
 
     - The input and output channels should be >= 16. The exception is for Conv layers in INT8 quantization mode,
       which supports it if the input or output channel % 8.
     - The filter size for FP8 conv kernels should be less than 32.
+    - For FP8 mode, Conv nodes with input or output channels <= _MIN_CHANNELS_FP8 are excluded.
+      Small-channel convolutions do not benefit from FP8 quantization.
 
     Args:
         graph: Onnx model graph.
@@ -1126,15 +1219,66 @@ def find_nodes_from_convs_to_exclude(graph: Graph, quantize_mode: str = "int8"):
             if quantize_mode == "fp8" and filter_size > 32:
                 logger.debug(f"Found large filter conv for FP8: {node.name}")
                 unsupported_conv_nodes.append(node.name)
+                # skip the small-channel check below; already excluded
+                continue
+
+            # For FP8, exclude small-channel convolutions. These layers do not benefit from
+            # FP8 quantization and cause perf regressions on GPUs where the FP8 conv kernels
+            # are slower than FP16 CASK kernels for small channels.
+            if quantize_mode == "fp8" and (
+                output_channel <= _MIN_CHANNELS_FP8 or input_channel <= _MIN_CHANNELS_FP8
+            ):
+                logger.debug(
+                    f"Excluding small-channel Conv from FP8 quantization: {node.name} "
+                    f"(IC={input_channel}, OC={output_channel}, threshold={_MIN_CHANNELS_FP8})"
+                )
+                unsupported_conv_nodes.append(node.name)
 
     logger.info(f"Found {len(unsupported_conv_nodes)} unsupported Conv nodes for quantization")
     return unsupported_conv_nodes
 
 
+def _get_inp_b_k_dim(
+    matmul_node, value_info_map: dict | None = None, output_map: dict | None = None
+):
+    """Get the K dimension from the second input of a MatMul/Gemm node.
+
+    Tries Constant shape first, then falls back to shape inference (value_info_map)
+    or runtime inference (output_map). For Gemm nodes, honors the ``transB`` attribute:
+    when ``transB=1``, B has shape ``[N, K]`` so K lives at axis -1; otherwise B is
+    ``[..., K, N]`` and K is at axis -2.
+
+    Returns:
+        The K dimension value, or None if it cannot be determined.
+    """
+    # For Gemm, transB=1 means B is [N, K] (K is last axis); default/MatMul is [K, N].
+    trans_b = bool(matmul_node.attrs.get("transB", 0)) if matmul_node.op == "Gemm" else False
+    k_axis = -1 if trans_b else -2
+
+    inp_b = matmul_node.inputs[1]
+    if hasattr(inp_b, "values") and inp_b.values is not None:
+        inp_b_shape = inp_b.values.shape
+        if len(inp_b_shape) >= 2:
+            return inp_b_shape[k_axis]
+    if value_info_map is not None:
+        inp_b_info = value_info_map.get(inp_b.name)
+        if inp_b_info:
+            inp_b_dims = inp_b_info.type.tensor_type.shape.dim
+            if len(inp_b_dims) >= 2:
+                return inp_b_dims[k_axis].dim_value
+    if output_map is not None and inp_b.name in output_map:
+        inp_b_out = output_map[inp_b.name]
+        if len(inp_b_out.shape) >= 2:
+            return inp_b_out.shape[k_axis]
+    return None
+
+
 def _exclude_matmuls_by_shape_inference(
-    model: onnx.ModelProto, matmul_nodes: list, calibration_shapes: str | dict | None = None
+    model: onnx.ModelProto,
+    matmul_nodes: list,
+    calibration_shapes: str | dict | None = None,
 ) -> list[str]:
-    """Use shape inference to find MatMuls with dimension 1."""
+    """Use shape inference to find MatMuls with dimension 1 or small K/N."""
     # Prepare model for symbolic inference
     for graph_input in model.graph.input:
         for dim in graph_input.type.tensor_type.shape.dim:
@@ -1163,7 +1307,10 @@ def _exclude_matmuls_by_shape_inference(
                 dim.dim_value = new_dim_value
 
     model = infer_shapes(model)
-    value_info_map = {vi.name: vi for vi in model.graph.value_info}
+    # Include graph inputs, value_info, and outputs so B that comes from a graph input
+    # is visible when deriving K.
+    value_info_map = {vi.name: vi for vi in model.graph.input}
+    value_info_map.update({vi.name: vi for vi in model.graph.value_info})
     value_info_map.update({vi.name: vi for vi in model.graph.output})
 
     nodes_to_exclude = []
@@ -1180,7 +1327,22 @@ def _exclude_matmuls_by_shape_inference(
 
             if dims[-1].dim_value == 1 or dims[-2].dim_value == 1:
                 nodes_to_exclude.append(matmul_node.name)
+                continue
         elif len(dims) < 3 and any(out.dim_value == 1 for out in dims):
+            nodes_to_exclude.append(matmul_node.name)
+            continue
+
+        # Small-gemm check: applies to both INT8 and FP8 quantization.
+        n_dim = dims[-1].dim_value if len(dims) >= 2 else 0
+        k_dim = _get_inp_b_k_dim(matmul_node, value_info_map=value_info_map)
+        small_n = 0 < n_dim < _MIN_MATMUL_DIM
+        small_k = k_dim is not None and 0 < k_dim < _MIN_MATMUL_DIM
+
+        if small_n or small_k:
+            logger.debug(
+                f"Excluding small-dim MatMul from quantization: {matmul_node.name} "
+                f"(N={n_dim}, K={k_dim}, threshold={_MIN_MATMUL_DIM})"
+            )
             nodes_to_exclude.append(matmul_node.name)
 
     return nodes_to_exclude
@@ -1195,10 +1357,20 @@ def _exclude_matmuls_by_inference(
     calibration_data_reader: CalibrationDataReader,
     calibration_eps: list[str],
 ) -> list[str]:
-    """Use actual inference to find MatMuls with dimension 1."""
-    # Add matmul outputs to model outputs
+    """Use actual inference to find MatMuls with dimension 1 or small K/N."""
+    # Add matmul outputs and second-input outputs to model outputs
+    existing_output_names = {out.name for out in model.graph.output}
     for matmul_node in matmul_nodes:
-        model.graph.output.extend([onnx.ValueInfoProto(name=matmul_node.outputs[0].name)])
+        out_name = matmul_node.outputs[0].name
+        if out_name not in existing_output_names:
+            model.graph.output.extend([onnx.ValueInfoProto(name=out_name)])
+            existing_output_names.add(out_name)
+        # Also add second input for K-dimension check (only if it's a Variable, not a Constant)
+        if isinstance(matmul_node.inputs[1], Variable):
+            inp_b_name = matmul_node.inputs[1].name
+            if inp_b_name not in existing_output_names:
+                model.graph.output.extend([onnx.ValueInfoProto(name=inp_b_name)])
+                existing_output_names.add(inp_b_name)
 
     output_map = get_extended_model_outputs(
         onnx_path,
@@ -1219,7 +1391,22 @@ def _exclude_matmuls_by_inference(
                 or matmul_output.shape[-2] == 1
             ):
                 nodes_to_exclude.append(matmul_node.name)
+                continue
         elif len(matmul_output.shape) < 3 and any(out == 1 for out in matmul_output.shape):
+            nodes_to_exclude.append(matmul_node.name)
+            continue
+
+        # Small-gemm check: applies to both INT8 and FP8 quantization.
+        n_dim = matmul_output.shape[-1] if len(matmul_output.shape) >= 2 else 0
+        k_dim = _get_inp_b_k_dim(matmul_node, output_map=output_map)
+        small_n = 0 < n_dim < _MIN_MATMUL_DIM
+        small_k = k_dim is not None and 0 < k_dim < _MIN_MATMUL_DIM
+
+        if small_n or small_k:
+            logger.debug(
+                f"Excluding small-dim MatMul from quantization: {matmul_node.name} "
+                f"(N={n_dim}, K={k_dim}, threshold={_MIN_MATMUL_DIM})"
+            )
             nodes_to_exclude.append(matmul_node.name)
 
     return nodes_to_exclude

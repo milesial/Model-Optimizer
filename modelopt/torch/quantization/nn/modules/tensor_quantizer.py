@@ -42,7 +42,7 @@ from modelopt.torch.utils.distributed import DistributedProcessGroup
 
 from ... import calib
 from ... import utils as quant_utils
-from ...config import QuantizerAttributeConfig
+from ...config import QuantizerAttributeConfig, RotateConfig
 from ...qtensor import (
     BaseQuantizedTensor,
     FP8QTensor,
@@ -188,6 +188,7 @@ class TensorQuantizer(nn.Module):
         if amax is not None:
             self.amax = amax
 
+        self._use_constant_amax = False
         self.set_from_attribute_config(quant_attribute_cfg)
 
         self._if_quant = if_quant
@@ -202,8 +203,8 @@ class TensorQuantizer(nn.Module):
         # Optional quantizer cache for caching quantizer related encoding or tensors.
         self._quantizer_cache = None
 
-    def set_from_attribute_config(self, attribute_cfg: QuantizerAttributeConfig | dict):
-        """Set quantizer attributes from attribute_dict.
+    def set_from_attribute_config(self, attribute_cfg: QuantizerAttributeConfig | dict[str, Any]):
+        """Set quantizer attributes from attribute_cfg.
 
         The attributes are defined in
         :class:`QuantizerAttributeConfig <modelopt.torch.quantization.config.QuantizerAttributeConfig>`.
@@ -217,14 +218,30 @@ class TensorQuantizer(nn.Module):
                 calib_cls, args, kwargs = standardize_constructor_args(val)
             return calib_cls(*args, **kwargs)
 
+        def _axis_setter(val):
+            if getattr(self, "_calibrator", None) is not None:
+                self._calibrator._axis = val
+            return val
+
+        def _block_sizes_setter(val):
+            if val is not None:
+                # block_sizes and axis are mutually exclusive; clear axis when block_sizes is set
+                setattr(self, "_axis", None)
+                if getattr(self, "_calibrator", None) is not None:
+                    self._calibrator._axis = None
+            return val
+
         # Some attributes need custom handling.
         # By default, attributes from config are mapped to a name ``f"_{attribute}"``
         _custom_setters: dict[str, tuple[str, Callable]] = {
             "enable": ("_disabled", lambda val: val is False),
             "type": ("_dynamic", lambda val: val == "dynamic"),
             "calibrator": ("_calibrator", _calibrator_setter),
+            "axis": ("_axis", _axis_setter),
+            "block_sizes": ("_block_sizes", _block_sizes_setter),
             "backend": ("backend", lambda val: val),
             "backend_extra_args": ("backend_extra_args", lambda val: val or {}),
+            "use_constant_amax": ("_use_constant_amax", lambda val: val),
         }
 
         for attribute, val in attribute_cfg.items():
@@ -532,16 +549,29 @@ class TensorQuantizer(nn.Module):
     @property
     def rotate_is_enabled(self):
         """Check if rotate is enabled in quant config."""
-        return self._rotate.get("enable", False) if isinstance(self._rotate, dict) else self._rotate
+        if isinstance(self._rotate, RotateConfig):
+            return self._rotate.enable
+        if isinstance(self._rotate, dict):  # backward compat: old checkpoints stored a dict
+            return self._rotate.get("enable", False)
+        return self._rotate  # bool
 
     @property
     def rotate_is_fp32(self):
         """Check if rotation needs to be computed in float32."""
-        return (
-            self._rotate.get("rotate_fp32", False)
-            if isinstance(self._rotate, dict) and self.rotate_is_enabled
-            else False
-        )
+        if isinstance(self._rotate, RotateConfig):
+            return self._rotate.rotate_fp32 if self._rotate.enable else False
+        if isinstance(self._rotate, dict) and self.rotate_is_enabled:
+            return self._rotate.get("rotate_fp32", False)
+        return False
+
+    @property
+    def rotate_block_size(self):
+        """Block size for block-granular RHT, or None for full/auto."""
+        if isinstance(self._rotate, RotateConfig):
+            return self._rotate.block_size if self._rotate.enable else None
+        if isinstance(self._rotate, dict) and self.rotate_is_enabled:
+            return self._rotate.get("block_size", None)
+        return None
 
     def disable_calib(self):
         """Disable calibration."""
@@ -613,6 +643,8 @@ class TensorQuantizer(nn.Module):
 
     def _get_amax(self, inputs):
         """Get amax from buffer or compute it dynamically."""
+        if self._use_constant_amax:
+            return torch.tensor(torch.finfo(torch.float8_e4m3fn).max, device=inputs.device)
         if hasattr(self, "_amax"):
             amax = self._amax
         else:
@@ -1011,7 +1043,11 @@ class TensorQuantizer(nn.Module):
 
         # Rotating the input
         if self.rotate_is_enabled:
-            inputs = normalized_hadamard_transform(inputs, rotate_fp32=self.rotate_is_fp32)
+            inputs = normalized_hadamard_transform(
+                inputs,
+                rotate_fp32=self.rotate_is_fp32,
+                block_size=self.rotate_block_size,
+            )
 
         if self._disabled:
             # if quantizer is disabled, we still need to track the input dtype for saving the model
@@ -1125,6 +1161,8 @@ class TensorQuantizer(nn.Module):
         )
         s += " rotated" if self.rotate_is_enabled else ""
         s += " (fp32)" if self.rotate_is_fp32 else ""
+        if self.rotate_block_size is not None:
+            s += f" (block={self.rotate_block_size})"
         s += (
             f" calibrator={self._calibrator.__class__.__name__}"
             if (self._calibrator is not None)
@@ -1338,7 +1376,7 @@ class SequentialQuantizer(nn.Sequential):
 
     """
 
-    _delegated_properties = ["fake_quant", "is_enabled"]
+    _delegated_properties = ["fake_quant", "is_enabled", "amax"]
     _delegated_methods = [
         "reset_amax",
         "disable",
@@ -1385,10 +1423,7 @@ class SequentialQuantizer(nn.Sequential):
         return {"num_quantizers": len(self), "is_sequential_quantizer": True}
 
     def set_from_attribute_config(
-        self,
-        attributes: list[dict[str, Any] | QuantizerAttributeConfig]
-        | dict[str, Any]
-        | QuantizerAttributeConfig,
+        self, attributes: list[QuantizerAttributeConfig] | list[dict[str, Any]]
     ):
         """Set the attributes of contained quantizers from a list of attribute_dicts."""
         if not isinstance(attributes, (list, tuple)):

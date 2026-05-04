@@ -16,8 +16,10 @@
 """Utility functions related to Onnx."""
 
 import base64
+import contextlib
 import inspect
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -25,6 +27,7 @@ from contextlib import nullcontext
 from typing import Any
 
 import onnx
+import onnxconverter_common.float16 as _f16_module
 import torch
 import torch.nn as nn
 from onnx import ModelProto
@@ -42,7 +45,11 @@ from modelopt.onnx.export import (
 )
 from modelopt.onnx.quantization.qdq_utils import qdq_to_dq, replace_zero_scale_with_smallest_nonzero
 from modelopt.onnx.utils import (
+    change_casts_to_fp16,
     check_model_uses_external_data,
+    fold_dq_fp32_to_fp16_casts,
+    fold_q_fp16_to_fp32_casts,
+    fold_qdq_scale_fp16_to_fp32_casts,
     get_input_names,
     get_input_shapes,
     get_node_names,
@@ -50,12 +57,37 @@ from modelopt.onnx.utils import (
     get_output_shapes,
     infer_shapes,
     remove_node_training_mode,
+    remove_redundant_casts,
 )
 from modelopt.torch.quantization.export_onnx import configure_linear_module_onnx_quantizers
 from modelopt.torch.utils import flatten_tree, standardize_named_model_args
 from modelopt.torch.utils._pytree import TreeSpec
 
 from ..utils.onnx_optimizer import Optimizer
+
+# Monkey-patch for onnxconverter_common bug in remove_unnecessary_cast_node():
+# cast_node_downstream_dict stores either a single node or a list of nodes, but the
+# downstream-node handling at lines ~770/787 always does `downstream_node.input`,
+# which raises AttributeError("'list' object has no attribute 'input'") when the
+# value is a list (i.e. a Cast output feeds multiple consumers).
+# TODO: Remove this patch once onnxconverter-common ships a fix.
+#   Upstream issue: https://github.com/microsoft/onnxconverter-common/issues/261
+_original_remove_unnecessary_cast_node = _f16_module.remove_unnecessary_cast_node
+
+_logger = logging.getLogger(__name__)
+
+
+def _patched_remove_unnecessary_cast_node(graph):
+    try:
+        _original_remove_unnecessary_cast_node(graph)
+    except AttributeError as e:
+        if "'list' object has no attribute 'input'" in str(e):
+            _logger.debug("Skipping remove_unnecessary_cast_node due to known upstream bug: %s", e)
+        else:
+            raise
+
+
+_f16_module.remove_unnecessary_cast_node = _patched_remove_unnecessary_cast_node
 
 ModelMetadata = dict[str, Any]
 ModelType = Any
@@ -374,6 +406,29 @@ def is_fp8_quantized(model: nn.Module) -> bool:
     return False
 
 
+@contextlib.contextmanager
+def _disable_fp8_conv_weight_quantizers(model: nn.Module):
+    """Temporarily disable FP8 weight quantizers on Conv layers during ONNX export.
+
+    The TorchScript ONNX exporter requires static kernel shapes for Conv operations,
+    but the TRT_FP8DequantizeLinear custom op produces outputs with unknown shapes in
+    the TorchScript IR, causing the _convolution symbolic to fail. Disabling Conv weight
+    quantizers during export allows the Conv to export with static-shape FP16/FP32 weights.
+    FP8 weight quantization is restored as a post-processing step in FP8QuantExporter.
+    """
+    disabled = []
+    for _, module in model.named_modules():
+        if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+            if hasattr(module, "weight_quantizer") and module.weight_quantizer.is_enabled:
+                module.weight_quantizer.disable()
+                disabled.append(module)
+    try:
+        yield
+    finally:
+        for module in disabled:
+            module.weight_quantizer.enable()
+
+
 def quantize_weights(model: nn.Module, onnx_model: onnx.ModelProto) -> onnx.ModelProto:
     """Real quantizes the weights in the onnx model.
 
@@ -413,6 +468,10 @@ def quantize_weights(model: nn.Module, onnx_model: onnx.ModelProto) -> onnx.Mode
         onnx_exporters.append(FP8QuantExporter)
     if is_int8_quantized(model):
         onnx_exporters.append(INT8QuantExporter)
+
+    if len(onnx_exporters) == 0:
+        print("No quantization exporters found for the model.")
+        return onnx_model
 
     for onnx_exporter in onnx_exporters:
         onnx_model = onnx_exporter.process_model(onnx_model)
@@ -490,7 +549,11 @@ def get_onnx_bytes_and_metadata(
     input_none_names = list(set(tree_spec_input.names) - set(input_names))
 
     use_torch_autocast = not (
-        is_fp4_quantized(model) or is_mxfp8_quantized(model) or weights_dtype == "fp32"
+        is_fp4_quantized(model)
+        or is_mxfp8_quantized(model)
+        or is_fp8_quantized(model)
+        or is_int8_quantized(model)
+        or weights_dtype == "fp32"
     )
     autocast = torch.autocast("cuda") if use_torch_autocast else nullcontext()
 
@@ -524,7 +587,13 @@ def get_onnx_bytes_and_metadata(
         if is_fp4_quantized(model) or is_mxfp8_quantized(model)
         else nullcontext()
     )
-    with torch.inference_mode(), autocast, quantizer_context:
+    # Disable FP8 Conv weight quantizers: TorchScript custom ops produce outputs with
+    # unknown shapes, causing _convolution symbolic to fail. Conv weights are quantized
+    # to FP8 in post-processing by FP8QuantExporter instead.
+    conv_wq_context = (
+        _disable_fp8_conv_weight_quantizers(model) if is_fp8_quantized(model) else nullcontext()
+    )
+    with torch.inference_mode(), autocast, quantizer_context, conv_wq_context:
         additional_kwargs = {}
         if not dynamo_export:
             additional_kwargs["dynamic_axes"] = dynamic_axes
@@ -560,38 +629,52 @@ def get_onnx_bytes_and_metadata(
         tree_spec_input, tree_spec_output, input_none_names, onnx_opt_graph, model
     )
 
-    # TODO: Remove manual ir_version change once ORT supports ir_version 11
-    onnx_opt_graph.ir_version = 10
-
-    # Convert dummy TRT_FP4QDQ nodes to 2DQ format if the model is quantized in FP4 mode
-    # Or convert weights to MXFP8 format if the model is quantized in MXFP8 mode
-    if is_int4_quantized(model) or is_fp4_quantized(model) or is_mxfp8_quantized(model):
-        onnx_opt_graph = quantize_weights(model, onnx_opt_graph)
+    onnx_opt_graph = quantize_weights(model, onnx_opt_graph)
 
     if dq_only:
         onnx_opt_graph = qdq_to_dq(onnx_opt_graph)
 
-    try:
-        # TODO: Single-precision torch model assumed
-        param_dtype = next(model.parameters()).dtype
-    except StopIteration:
-        param_dtype = torch.float32
-    if weights_dtype in ["fp16", "bf16"] and param_dtype == torch.float32:
-        if is_int4_quantized(model) or is_mxfp8_quantized(model):
+    if weights_dtype in ["fp16", "bf16"]:
+        if (
+            is_int4_quantized(model)
+            or is_mxfp8_quantized(model)
+            or is_fp8_quantized(model)
+            or is_int8_quantized(model)
+        ):
             assert weights_dtype == "fp16", "BF16 + MXFP8/INT4 mixed precision is not supported yet"
             onnx_opt_graph = convert_float_to_float16(
                 onnx_opt_graph,
                 keep_io_types=False,
                 disable_shape_infer=True,
                 check_fp16_ready=False,
+                op_block_list=["QuantizeLinear", "DequantizeLinear", "Div"],
             )
+            # Change FP32 cast nodes feeding into Concat/Add to FP16
+            op_list = ["Concat", "Add", "Sqrt", "LayerNormalization", "Clip", "Mul", "Exp"]
+            onnx_opt_graph = change_casts_to_fp16(onnx_opt_graph, op_list)
+            # Remove Cast(FP32->FP16) nodes after DQ by setting DQ output to FP16 directly
+            onnx_opt_graph = fold_dq_fp32_to_fp16_casts(onnx_opt_graph)
+            # Remove Cast(FP16->FP32) feeding Q/DQ scales so DQ stays FP16 for downstream
+            # MatMul/Add layers under strongly-typed TRT parsing.
+            onnx_opt_graph = fold_qdq_scale_fp16_to_fp32_casts(onnx_opt_graph)
         else:
             onnx_opt_graph = convert_to_f16(
                 onnx_opt_graph, low_precision_type=weights_dtype, keep_io_types=False
             )
 
-        # TensorRT expects all scales to be postive
-        onnx_opt_graph = replace_zero_scale_with_smallest_nonzero(onnx_opt_graph)
+    onnx_opt_graph = remove_redundant_casts(onnx_opt_graph)
+
+    # Remove Cast nodes around Q/DQ for optimal TRT fusion
+    if is_fp8_quantized(model):
+        onnx_opt_graph = fold_q_fp16_to_fp32_casts(onnx_opt_graph)
+        onnx_opt_graph = fold_dq_fp32_to_fp16_casts(onnx_opt_graph)
+
+    # TensorRT expects all scales to be postive
+    onnx_opt_graph = replace_zero_scale_with_smallest_nonzero(onnx_opt_graph)
+
+    # TODO: Remove manual ir_version change once ORT supports ir_version 11
+    # Must be set after all gs.export_onnx() calls as graphsurgeon resets ir_version
+    onnx_opt_graph.ir_version = 10
 
     # If the onnx model contains external data store the external tensors in one file and save the onnx model
     if has_external_data(onnx_save_path):

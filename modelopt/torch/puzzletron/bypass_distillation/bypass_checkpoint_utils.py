@@ -28,7 +28,7 @@ import modelopt.torch.utils.distributed as dist
 from modelopt.torch.puzzletron.anymodel.model_descriptor import ModelDescriptor
 from modelopt.torch.puzzletron.tools.checkpoint_utils_hf import save_checkpoint
 from modelopt.torch.puzzletron.tools.logger import aprint, mprint
-from modelopt.torch.puzzletron.tools.robust_json import json_dump
+from modelopt.torch.utils.robust_json import json_dump
 
 from .stitched_model_factory import StitchedModuleDescriptor
 

@@ -16,45 +16,44 @@
 
 """Calc subblock stats to compute memory and runtime statistics for subblocks."""
 
+import copy
 import dataclasses
 import json
 import os
+import warnings
 from functools import partial
 from itertools import product
 from pathlib import Path
 from typing import Iterable, Optional, Type, TypeVar
-
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import pandas as pd
 import torch
 from immutabledict import immutabledict
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from tqdm import tqdm
+from transformers import PretrainedConfig
 
-from modelopt.torch.puzzletron.anymodel.model_descriptor import (
-    ModelDescriptor,
-    ModelDescriptorFactory,
-)
-from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import (
-    AttentionConfig,
-    BlockConfig,
-    FFNConfig,
-    SubblockConfig,
-)
-from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.configuration_decilm import DeciLMConfig
-from modelopt.torch.puzzletron.replacement_library.replacement_utils import parse_layer_replacement
-from modelopt.torch.puzzletron.subblock_stats.calc_subblock_params_and_memory import (
+from modelopt.torch.utils import json_dump
+
+from ..anymodel.model_descriptor import ModelDescriptor, ModelDescriptorFactory
+from ..block_config import AttentionConfig, BlockConfig, FFNConfig, SubblockConfig
+from ..replacement_library.replacement_utils import parse_layer_replacement
+from ..tools.checkpoint_utils import load_model_config
+from ..tools.logger import mprint
+from ..utils.parsing import format_global_config
+from .calc_subblock_params_and_memory import (
     calc_subblock_active_params,
     calculate_non_block_memory,
     calculate_non_block_params,
     calculate_subblock_memory,
     calculate_subblock_params,
 )
-from modelopt.torch.puzzletron.tools.checkpoint_utils import load_model_config
-from modelopt.torch.puzzletron.tools.logger import mprint
-from modelopt.torch.puzzletron.tools.robust_json import json_dump
-from modelopt.torch.puzzletron.utils.parsing import format_global_config
+
+__all__ = [
+    "calculate_subblock_stats",
+    "launch_calc_subblock_stats",
+    "add_int8_runtime_estimates",
+]
 
 # Type variable for dataclasses
 T_DataClass = TypeVar("T_DataClass")
@@ -72,6 +71,8 @@ python -m modelopt.torch.puzzletron.subblock_stats.calc_subblock_stats PUZZLE_DI
 def calculate_subblock_stats(
     calc_subblock_stats_config: DictConfig,
     teacher_dir: Path,
+    model_config: PretrainedConfig,
+    descriptor: Type[ModelDescriptor],
     master_puzzle_dir: Path,
     subblock_configs: list[immutabledict[str, AttentionConfig | FFNConfig]],
     batch_size: int,
@@ -116,6 +117,7 @@ def calculate_subblock_stats(
     }
     # Compute runtime stats for unique subblocks only
     if is_calc_runtime:
+        raise NotImplementedError("Runtime stats calculation is not implemented yet")
         subblock_configs_nolayerindex = set(
             [subblock_config["subblock_config"] for subblock_config in subblock_configs]
         )
@@ -149,6 +151,11 @@ def calculate_subblock_stats(
         subblock_config = subblock_config_indexed["subblock_config"]
         parent_layer_indices = subblock_config_indexed["parent_layer_indices"]
 
+        layer_model_config = copy.deepcopy(model_config)
+        ModelDescriptor.truncate_pattern_for_subblock(
+            descriptor.get_language_model_config(layer_model_config), parent_layer_indices[0]
+        )
+
         if is_calc_runtime:
             total_runtime_ms = runtime_by_subblock_dict[subblock_config]
             prefill_runtime_ms = None
@@ -167,14 +174,22 @@ def calculate_subblock_stats(
             weights_dtype,
             kv_cache_dtype,
             allocate_prefill_query,
+            model_config=layer_model_config,
+            descriptor=descriptor,
         )
         if not isinstance(subblock_memory, dict):
             subblock_memory = {"memory_mib": subblock_memory, "kv_cache_memory_mib": 0.0}
 
-        subblock_params = calculate_subblock_params(subblock_config, n_embd, n_head)
+        subblock_params = calculate_subblock_params(layer_model_config, subblock_config, descriptor)
         if moe_stats_file is not None:
             subblock_active_params = calc_subblock_active_params(
-                subblock_config, n_embd, n_head, moe_stats_file, batch_size, parent_layer_indices[0]
+                subblock_config,
+                layer_model_config,
+                descriptor,
+                n_embd,
+                moe_stats_file,
+                batch_size,
+                parent_layer_indices[0],
             )
         else:
             subblock_active_params = subblock_params
@@ -193,7 +208,6 @@ def calculate_subblock_stats(
         )
 
     if is_calc_runtime:
-        pass
         # TODO: fix
         # from puzzle_tools.calc_subblock_runtime import measure_non_block_runtime_ms
         # non_block_runtime_ms, embedding_runtime_ms, lm_head_runtime_ms = \
@@ -289,7 +303,7 @@ def calculate_subblock_stats_for_puzzle_dir(
     model_config = load_model_config(teacher_dir, trust_remote_code=trust_remote_code)
     # Get language model config for LM-specific attributes (VL models have nested config)
     lm_config = descriptor.get_language_model_config(model_config)
-    subblock_configs = _load_subblock_configs(master_puzzle_dir, ffn_hidden_sizes, model_config)
+    subblock_configs = _load_subblock_configs(master_puzzle_dir, ffn_hidden_sizes)
 
     subblock_stats_file = master_puzzle_dir / subblock_stats_filename
     if subblock_stats_file.exists() and not merge_with_existing_stats:
@@ -305,7 +319,7 @@ def calculate_subblock_stats_for_puzzle_dir(
 
     moe_stats_file = master_puzzle_dir / moe_stats_filename
     if not moe_stats_file.exists():
-        Warning(
+        warnings.warn(
             f"MOE stats file {moe_stats_file} does not exist, can't calculate num active params"
         )
         moe_stats_file = None
@@ -337,6 +351,8 @@ def calculate_subblock_stats_for_puzzle_dir(
         curr_subblock_stats = calculate_subblock_stats(
             calc_subblock_stats_config,
             teacher_dir=teacher_dir,
+            model_config=model_config,
+            descriptor=descriptor,
             master_puzzle_dir=master_puzzle_dir,
             subblock_configs=subblock_configs,
             batch_size=batch_size,
@@ -370,7 +386,7 @@ def calculate_subblock_stats_for_puzzle_dir(
 
 
 def _load_subblock_configs(
-    master_puzzle_dir: Path, ffn_hidden_sizes: ListConfig, model_config: DeciLMConfig
+    master_puzzle_dir: Path, ffn_hidden_sizes: ListConfig
 ) -> list[SubblockConfig]:
     try:
         subblock_configs = _load_subblock_configs_from_replacement_library(master_puzzle_dir)
@@ -400,7 +416,12 @@ def _load_subblock_configs_from_subblock_library(master_puzzle_dir: Path) -> lis
     )
     attention_configs = subblocks_df["attention_config"].dropna().drop_duplicates().tolist()
     ffn_configs = subblocks_df["ffn_config"].dropna().drop_duplicates().tolist()
-    subblock_configs = attention_configs + ffn_configs
+    # Wrap in the same dict format expected by calculate_subblock_stats() callers.
+    # Use parent_layer_indices=(-1,) to indicate no specific parent layer.
+    subblock_configs = [
+        immutabledict({"subblock_config": cfg, "parent_layer_indices": (-1,)})
+        for cfg in attention_configs + ffn_configs
+    ]
     return subblock_configs
 
 

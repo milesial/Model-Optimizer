@@ -42,7 +42,7 @@ from modelopt.torch.puzzletron.decilm.deci_lm_hf_code.block_config import maybe_
 from modelopt.torch.puzzletron.tools.common import infer_weights_dtype
 from modelopt.torch.puzzletron.tools.logger import mprint
 from modelopt.torch.puzzletron.tools.post_init_sparse import SparsityMethod
-from modelopt.torch.puzzletron.tools.robust_json import json_dumps
+from modelopt.torch.utils.robust_json import json_dumps
 
 SAFETENSORS_SUBBLOCKS_DIR_NAME = "subblocks_safetensors"
 PTH_SUBBLOCKS_DIR_NAME = "subblocks"

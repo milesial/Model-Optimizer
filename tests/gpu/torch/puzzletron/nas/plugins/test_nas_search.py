@@ -23,7 +23,7 @@ from _test_utils.torch.puzzletron.utils import setup_test_model_and_data
 
 import modelopt.torch.nas as mtn
 import modelopt.torch.utils.distributed as dist
-from modelopt.torch.puzzletron.nas.plugins.puzzletron_nas_plugin import PuzzletronModel
+from modelopt.torch.puzzletron.puzzletron_nas_plugin import PuzzletronModel
 
 
 def test_nas_search(project_root_path: Path, tmp_path: Path):

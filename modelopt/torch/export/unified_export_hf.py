@@ -52,11 +52,7 @@ except ImportError:
 from torch.distributed.fsdp import FSDPModule
 
 from modelopt.torch.quantization import set_quantizer_by_cfg_context
-from modelopt.torch.quantization.nn import (
-    NVFP4StaticQuantizer,
-    SequentialQuantizer,
-    TensorQuantizer,
-)
+from modelopt.torch.quantization.nn import SequentialQuantizer, TensorQuantizer
 from modelopt.torch.quantization.qtensor import MXFP8QTensor, NVFP4QTensor
 from modelopt.torch.quantization.utils import fsdp2_aware_weight_update, quantizer_attr_names
 
@@ -73,6 +69,7 @@ from .layer_utils import (
     is_moe,
     is_quantlinear,
     set_expert_quantizer_amax,
+    sync_moe_gate_up_amax,
 )
 from .model_config import (
     QUANTIZATION_FP8,
@@ -87,7 +84,8 @@ from .model_config import (
     QUANTIZATION_W4A8_NVFP4_FP8,
 )
 from .model_utils import get_language_model_from_vl, is_multimodal_model
-from .plugins import export_spec_ckpt_config, export_spec_ckpt_state_dict, spec_opt_only
+from .moe_utils import _export_fused_experts
+from .plugins import SpeculativeDecodingExporter, has_spec_opt
 from .quant_utils import (
     fuse_prequant_layernorm,
     fuse_prequant_to_linear,
@@ -104,7 +102,7 @@ from .quant_utils import (
     to_quantized_weight,
 )
 
-__all__ = ["export_hf_checkpoint"]
+__all__ = ["export_hf_checkpoint", "export_speculative_decoding"]
 
 
 def _is_enabled_quantizer(quantizer):
@@ -162,7 +160,7 @@ def _save_component_state_dict_safetensors(
         json.dump(metadata, f, indent=4)
 
 
-def _collect_shared_input_modules(
+def collect_shared_input_modules(
     model: nn.Module,
     dummy_forward_fn: Callable[[], None],
     collect_layernorms: bool = False,
@@ -217,7 +215,10 @@ def _collect_shared_input_modules(
 
     # Run dummy forward pass to collect modules sharing same input
     try:
-        with torch.no_grad(), set_quantizer_by_cfg_context(model, {"*": {"enable": False}}):
+        with (
+            torch.no_grad(),
+            set_quantizer_by_cfg_context(model, [{"quantizer_name": "*", "enable": False}]),
+        ):
             dummy_forward_fn()
     finally:
         # Always remove hooks
@@ -377,10 +378,13 @@ def requantize_resmooth_fused_llm_layers(model: torch.nn.Module):
         elif getattr(model.config, "is_encoder_decoder", False):
             # For other encoder-decoder models (non-VL), pass both encoder and decoder input ids
             model(fake_input, decoder_input_ids=decoder_fake_input)
+        elif hasattr(model, "get_dummy_inputs"):
+            # For speculative decoding models (EAGLE, etc.), use model-provided dummy inputs
+            model(**model.get_dummy_inputs())
         else:
             model(fake_input)
 
-    input_to_linear, output_to_layernorm = _collect_shared_input_modules(
+    input_to_linear, output_to_layernorm = collect_shared_input_modules(
         model, llm_dummy_forward, collect_layernorms=True
     )
 
@@ -531,11 +535,12 @@ def _export_quantized_weight(
         expert_type in type(sub_module).__name__
         for expert_type in ["Llama4TextExperts", "GptOssExperts"]
     )
-    if is_bmm_expert_weight and isinstance(weight_quantizer, NVFP4StaticQuantizer):
-        raise ValueError(
-            "NVFP4StaticQuantizer with BMM-style expert weights (e.g. Llama4TextExperts, "
-            "GptOssExperts) is not yet supported."
-        )
+    # NVFP4StaticQuantizer + BMM-style experts: route through the static-aware
+    # ``_from_quantizer`` helper so the pinned per-block ``_amax`` (e.g. set by
+    # the MXFP4->NVFP4 cast to ``6 * 2^k_j``) is used to derive the FP8
+    # per-block scale. The plain ``get_weights_scaling_factor`` would ignore
+    # ``_amax`` and recompute per-block max from the BF16 weight, which
+    # rebuckets nibbles and loses bit-exactness when ``max_nibble < 6``.
 
     if quantization_format in [
         QUANTIZATION_NVFP4,
@@ -548,11 +553,18 @@ def _export_quantized_weight(
             weight, is_bmm_expert_weight=is_bmm_expert_weight
         )
 
-        weight_scale = NVFP4QTensor.get_weights_scaling_factor(
-            weight,
-            block_size=block_size,
-            weights_scaling_factor_2=weight_scale_2,
-        )[0]
+        if NVFP4QTensor._is_static_quantizer(weight_quantizer):
+            weight_scale = NVFP4QTensor.get_weights_scaling_factor_from_quantizer(
+                weight_quantizer,
+                weight,
+                weight_scale_2,
+            )[0]
+        else:
+            weight_scale = NVFP4QTensor.get_weights_scaling_factor(
+                weight,
+                block_size=block_size,
+                weights_scaling_factor_2=weight_scale_2,
+            )[0]
 
         quantized_weight = to_quantized_weight(
             weight.to(dtype),
@@ -635,11 +647,23 @@ def _process_quantized_modules(
         if is_modelopt_qlora and (hasattr(sub_module, "base_layer")):
             continue
 
+        # Preprocessing: restore unpacked weight so the export path can read
+        # the live quantizer state. Falls through to the export branches below.
         if hasattr(sub_module, "weight_packed") or (
             "QuantFP8Linear" in type(sub_module).__name__ and sub_module.weight.element_size() <= 1
         ):
             sub_module.unpack_weight()
-        if get_quantization_format(sub_module) != QUANTIZATION_NONE:
+
+        if hasattr(sub_module, "gate_up_proj_weight_quantizers"):
+            # _QuantFusedExperts uses plural `gate_up_proj_weight_quantizers` (ModuleList),
+            # which get_quantization_format's singular-weight_quantizer check misses. Handle
+            # it explicitly before the format gate so fused-experts get split + quantized.
+            with fsdp2_aware_weight_update(model, sub_module, reshard=False):
+                _export_fused_experts(sub_module, dtype)
+        elif get_quantization_format(sub_module) != QUANTIZATION_NONE:
+            # Skip QuantMoELinear - it's handled separately in _reconstruct_fused_moe_linear
+            if type(sub_module).__name__ == "QuantMoELinear":
+                continue
             if is_quantlinear(sub_module):
                 try:
                     with fsdp2_aware_weight_update(model, sub_module, reshard=False):
@@ -711,6 +735,9 @@ def _export_transformers_checkpoint(
                                 modules=list(linear_modulelist),
                                 quantizer_attrs=["input_quantizer"],
                             )
+                elif hasattr(sub_module.experts, "gate_up_proj_weight_quantizers"):
+                    # _QuantFusedExperts: amax fallback is handled in _export_fused_experts
+                    break
                 elif "QuantGptOssExperts" in type(sub_module.experts).__name__:
                     # Handle GPT-OSS experts specifically
                     # GPT-OSS experts use gate_up_proj and down_proj
@@ -775,8 +802,25 @@ def _export_transformers_checkpoint(
                 exclude_modules.append(pattern)
                 print(f"Adding MTP layer to quantization_config ignore: {pattern}")
 
+    # Safety net: sync any gate/up weight quantizer amaxes that
+    # requantize_resmooth_fused_llm_layers did not reach (e.g. experts not
+    # activated during the dummy forward, or non-standard expert naming).
+    synced = sync_moe_gate_up_amax(model)
+    if synced:
+        warnings.warn(
+            f"Found {synced} MoE expert gate/up projection pair(s) with mismatched "
+            f"weight_scale_2 after requantize_resmooth_fused_llm_layers. "
+            f"This typically means the dummy forward did not activate these experts. "
+            f"Taking element-wise max of amaxes for serving-engine fusion."
+        )
+
     # Process all quantized modules and export weights
     _process_quantized_modules(model, dtype, is_modelopt_qlora)
+
+    # Reconstruct fused MoELinear: per-expert _QuantLinear weights → original 3D format
+    from modelopt.torch.quantization.plugins.huggingface import _reconstruct_fused_moe_linear
+
+    _reconstruct_fused_moe_linear(model)
 
     if accelerator is not None:
         # Gather state_dict from all ranks
@@ -825,7 +869,7 @@ def _fuse_qkv_linears_diffusion(
 
     # Collect modules sharing the same input
     try:
-        input_to_linear, _ = _collect_shared_input_modules(
+        input_to_linear, _ = collect_shared_input_modules(
             model, dummy_forward_fn, collect_layernorms=False
         )
     except Exception as e:
@@ -1086,6 +1130,18 @@ def _unpatch_revert_weight_conversion(patches: list[tuple[Any, Any]]) -> None:
         mod.revert_weight_conversion = original
 
 
+def export_speculative_decoding(
+    model: torch.nn.Module,
+    dtype: torch.dtype | None = None,
+    export_dir: Path | str = tempfile.gettempdir(),
+) -> None:
+    """Export speculative decoding HuggingFace model checkpoint."""
+    assert has_spec_opt(model), "Model is not optimized for speculative decoding."
+
+    exporter: SpeculativeDecodingExporter = model.get_exporter()
+    exporter.export(export_dir, dtype)
+
+
 def export_hf_checkpoint(
     model: Any,
     dtype: torch.dtype | None = None,
@@ -1093,6 +1149,7 @@ def export_hf_checkpoint(
     save_modelopt_state: bool = False,
     components: list[str] | None = None,
     extra_state_dict: dict[str, torch.Tensor] | None = None,
+    max_shard_size: int | str = "10GB",
     **kwargs,
 ):
     """Export quantized HuggingFace model checkpoint (transformers or diffusers).
@@ -1111,6 +1168,7 @@ def export_hf_checkpoint(
         components: Only used for diffusers pipelines. Optional list of component names
             to export. If None, all quantized components are exported.
         extra_state_dict: Extra state dictionary to add to the exported model.
+        max_shard_size: Maximum size of each safetensors shard file. Defaults to "10GB".
         **kwargs: Internal-only keyword arguments. Supported key: merged_base_safetensor_path
             (str, optional). When provided, merges the exported diffusion transformer
             weights with non-transformer components (VAE, vocoder, text encoders, etc.)
@@ -1128,17 +1186,8 @@ def export_hf_checkpoint(
         is_diffusers_obj = is_diffusers_object(model)
     if is_diffusers_obj:
         _export_diffusers_checkpoint(
-            model, dtype, export_dir, components, merged_base_safetensor_path
+            model, dtype, export_dir, components, merged_base_safetensor_path, max_shard_size
         )
-        return
-
-    # Transformers model export
-    # NOTE: (hg) Early exit for speculative decoding models
-    # This is a temp workaround to avoid error with offline spec ckpt during export
-    if spec_opt_only(model):
-        save_file(export_spec_ckpt_state_dict(model), f"{export_dir}/model.safetensors")
-        with open(f"{export_dir}/config.json", "w") as file:
-            json.dump(export_spec_ckpt_config(model), file, indent=4)
         return
 
     try:
@@ -1167,6 +1216,7 @@ def export_hf_checkpoint(
                 export_dir,
                 state_dict={**post_state_dict, **(extra_state_dict or {})},
                 save_modelopt_state=save_modelopt_state,
+                max_shard_size=max_shard_size,
             )
         finally:
             _unpatch_revert_weight_conversion(_patches)

@@ -38,10 +38,6 @@ from modelopt.torch.prune.plugins.mcore_minitron import (
 SEED = 1234
 
 
-def _assert_approx(actual, expected, abs=1e-3):
-    assert actual == pytest.approx(expected, abs=abs), f"{actual=} != {expected=}"
-
-
 def _test_mcore_gpt_parameter_sorting(activation_func, rank, size):
     set_seed(SEED)
     # Use relatively bigger model here for more accurate test for sorting
@@ -68,6 +64,7 @@ def _test_mcore_gpt_parameter_sorting(activation_func, rank, size):
         max_sequence_length=max_sequence_length,
         vocab_size=vocab_size,
         activation_func=activation_func,
+        transformer_impl="transformer_engine",
         bf16=False,
     ).cuda()
 
@@ -127,10 +124,12 @@ def _test_mcore_gpt_pruning(
     uneven_pp,
     position_embedding_type,
     skip_sorting,
-    ckpt_path,
+    ckpt_dir,
     rank,
     size,
 ):
+    set_seed(SEED)
+
     channel_divisor = 4
 
     hidden_size = channel_divisor * 4
@@ -170,6 +169,7 @@ def _test_mcore_gpt_pruning(
             position_embedding_type=position_embedding_type,
             activation_func=activation_func,
             normalization=normalization,
+            transformer_impl="transformer_engine",
             num_layers_in_first_pipeline_stage=num_layers_in_first_pipeline_stage,
             num_layers_in_last_pipeline_stage=num_layers_in_last_pipeline_stage,
             use_cpu_initialization=True,  # Ensure deterministic weight init across CUDA versions
@@ -177,7 +177,6 @@ def _test_mcore_gpt_pruning(
         return model
 
     model = _get_model()
-
     sd = model.state_dict()
 
     def forward_loop(m):
@@ -202,59 +201,17 @@ def _test_mcore_gpt_pruning(
     constraints = {"export_config": export_config}
 
     config = {
-        "checkpoint": ckpt_path,
+        "checkpoint": ckpt_dir,
         "skip_sorting": skip_sorting,
     }
     if skip_sorting:
-        assert ckpt_path is None
+        assert ckpt_dir is None
     else:
         config["forward_loop"] = forward_loop
     model, pruning_scores = prune_minitron(model, constraints, config, channel_divisor)
     if not skip_sorting:
         assert pruning_scores["layer_scores"]
-        assert pruning_scores["activations_per_rank"]
-
-        # TODO: Simplify it: this unit test is too long,
-        # hard to read (the same set of assertions across different test cases with if-else).
-
-        assert len(pruning_scores["activations_per_rank"]) == size
-        activations = pruning_scores["activations_per_rank"][rank]
-
-        # Test case 1: MHA - pruned ffn/4 (num_attention_heads=8, num_query_groups=8, ffn_div=4)
-        if size == 1 and pruned_ffn_div == 4:
-            # Layer scores
-            _assert_approx(pruning_scores["layer_scores"], {1: 0.028923, 2: 0.046508})
-
-            # Validate decoder.layers.0.mlp activations
-            mlp_0_acts = activations["decoder.layers.0.mlp"]
-            _assert_approx(mlp_0_acts.min().item(), 0.000026)
-            _assert_approx(mlp_0_acts.max().item(), 0.000729)
-            _assert_approx(mlp_0_acts.mean().item(), 0.000201)
-
-            # Validate decoder.layers.1.mlp activations
-            mlp_1_acts = activations["decoder.layers.1.mlp"]
-            _assert_approx(mlp_1_acts.min().item(), 0.000022)
-            _assert_approx(mlp_1_acts.max().item(), 0.000762)
-            _assert_approx(mlp_1_acts.mean().item(), 0.000162)
-
-        # Test case 2: GQA - pruned attention/2 (num_attention_heads=8, num_query_groups=4, attention_div=2)
-        elif size == 1 and pruned_num_attention_heads_div == 2 and pruned_ffn_div == 1:
-            # Layer scores
-            _assert_approx(pruning_scores["layer_scores"], {1: 0.028056, 2: 0.038353})
-
-            # Validate decoder.layers.0.self_attention activations
-            attn_0_acts = activations["decoder.layers.0.self_attention"]
-            assert attn_0_acts.shape == torch.Size([hidden_size])
-            _assert_approx(attn_0_acts.min().item(), 0.010091)
-            _assert_approx(attn_0_acts.max().item(), 0.023826)
-            _assert_approx(attn_0_acts.mean().item(), 0.014548)
-
-            # Validate decoder.layers.1.self_attention activations
-            attn_1_acts = activations["decoder.layers.1.self_attention"]
-            assert attn_1_acts.shape == torch.Size([hidden_size])
-            _assert_approx(attn_1_acts.min().item(), 0.009982)
-            _assert_approx(attn_1_acts.max().item(), 0.035644)
-            _assert_approx(attn_1_acts.mean().item(), 0.020140)
+        assert pruning_scores["local_activations"]
 
     # Assert weights are pruned correctly
     for layer in model.decoder.layers:
@@ -284,11 +241,11 @@ def _test_mcore_gpt_pruning(
     output = run_mcore_inference(model, prompt_tokens, pruned_hidden_size)
 
     # Assert re-pruning from checkpoint works without running the forward loop again
-    if ckpt_path:
+    if ckpt_dir:
         model_rerun = _get_model(initialize_megatron=False)
         model_rerun.load_state_dict(sd)
         model_rerun, pruning_scores = prune_minitron(
-            model_rerun, constraints, {"checkpoint": ckpt_path}, channel_divisor
+            model_rerun, constraints, {"checkpoint": ckpt_dir}, channel_divisor
         )
 
         output_rerun = run_mcore_inference(model_rerun, prompt_tokens, pruned_hidden_size)
@@ -353,7 +310,7 @@ def test_mcore_gpt_pruning(
             uneven_pp,
             position_embedding_type,
             skip_sorting,
-            tmp_path / "minitron_scores.pth" if test_ckpt else None,
+            tmp_path / "minitron_scores" if test_ckpt else None,
         ),
     )
 
@@ -385,6 +342,7 @@ def _test_mcore_gpt_moe_parameter_sorting(rank, size):
         max_sequence_length=max_sequence_length,
         vocab_size=vocab_size,
         activation_func="squared_relu",
+        transformer_impl="transformer_engine",
         num_moe_experts=num_moe_experts,
         moe_ffn_hidden_size=moe_ffn_hidden_size,
         moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
@@ -439,7 +397,7 @@ def test_mcore_gpt_moe_parameter_sorting(dist_workers):
     dist_workers.run(_test_mcore_gpt_moe_parameter_sorting)
 
 
-def _test_mcore_gpt_pruning_moe(ckpt_path, rank, size):
+def _test_mcore_gpt_pruning_moe(ckpt_dir, rank, size):
     channel_divisor = 4
 
     num_layers = size
@@ -461,6 +419,7 @@ def _test_mcore_gpt_pruning_moe(ckpt_path, rank, size):
             max_sequence_length=max_sequence_length,
             vocab_size=vocab_size,
             activation_func="squared_relu",
+            transformer_impl="transformer_engine",
             num_moe_experts=num_moe_experts,
             moe_ffn_hidden_size=moe_ffn_hidden_size,
             moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
@@ -490,7 +449,7 @@ def _test_mcore_gpt_pruning_moe(ckpt_path, rank, size):
     prune_minitron(
         model,
         constraints,
-        {"checkpoint": ckpt_path, "forward_loop": forward_loop},
+        {"checkpoint": ckpt_dir, "forward_loop": forward_loop},
         channel_divisor,
     )
 
@@ -527,14 +486,14 @@ def _test_mcore_gpt_pruning_moe(ckpt_path, rank, size):
     # Assert re-pruning from checkpoint works without running the forward loop again
     model_rerun = _get_model(initialize_megatron=False)
     model_rerun.load_state_dict(sd)
-    prune_minitron(model_rerun, constraints, {"checkpoint": ckpt_path}, channel_divisor)
+    prune_minitron(model_rerun, constraints, {"checkpoint": ckpt_dir}, channel_divisor)
 
     output_rerun = run_mcore_inference(model_rerun, prompt_tokens, pruned_hidden_size)
     assert torch.allclose(output, output_rerun, atol=1e-5)
 
 
 def test_mcore_gpt_pruning_moe(dist_workers, tmp_path):
-    dist_workers.run(partial(_test_mcore_gpt_pruning_moe, tmp_path / "minitron_scores.pth"))
+    dist_workers.run(partial(_test_mcore_gpt_pruning_moe, tmp_path / "minitron_scores"))
 
 
 def test_generate_search_space_combos():

@@ -21,7 +21,7 @@ import torch
 from torch.autograd import Function
 from torch.onnx import symbolic_helper
 
-import modelopt.torch.quantization.triton as triton_kernel
+import modelopt.torch.kernels.quantization.gemm as triton_kernel
 
 from .config import QuantizerAttributeConfig
 from .extensions import get_cuda_ext, get_cuda_ext_fp8, get_cuda_ext_mx
@@ -45,9 +45,13 @@ DISABLE_TRITON_KERNEL = False
 def _fp8_eager(x, amax=None):
     dtype = x.dtype
     if amax is not None:
-        scale = 448.0 / (amax.to(torch.float32))
+        amax = amax.to(torch.float32)
+        epsilon = 1.0 / (1 << 24)
+        zero_amax_mask = amax <= epsilon
+        safe_amax = torch.where(zero_amax_mask, torch.ones_like(amax), amax)
+        scale = 448.0 / safe_amax
         scale_inv = 1 / scale
-        x = x.to(torch.float32) * scale
+        x = (x.to(torch.float32) * scale).clamp(min=-448.0, max=448.0)
     x = x.to(torch.float8_e4m3fn)
     if amax is not None:
         x = x.to(torch.float32) * scale_inv
