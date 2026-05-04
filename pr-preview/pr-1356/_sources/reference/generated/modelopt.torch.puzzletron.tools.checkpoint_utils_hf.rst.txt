@@ -41,6 +41,7 @@ checkpoint\_utils\_hf
       load_model_config
       init_model_from_config
       save_checkpoint
+      save_checkpoint_from_shards
       save_subblocks
       save_model_config
    

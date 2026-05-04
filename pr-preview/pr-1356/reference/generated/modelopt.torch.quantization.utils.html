@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>utils &mdash; Model Optimizer 0.0.1.dev1+gd11b33ced</title>
+  <title>utils &mdash; Model Optimizer 0.0.1.dev1+g95d73d3ec</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
@@ -203,10 +203,13 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.quantization.utils.replace_function" title="modelopt.torch.quantization.utils.replace_function"><code class="xref py py-obj docutils literal notranslate"><span class="pre">replace_function</span></code></a></p></td>
 <td><p>Replace a function with a new one within a context.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.quantization.utils.update_quant_cfg_with_kv_cache_quant" title="modelopt.torch.quantization.utils.update_quant_cfg_with_kv_cache_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">update_quant_cfg_with_kv_cache_quant</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.quantization.utils.representative_weight_quantizer" title="modelopt.torch.quantization.utils.representative_weight_quantizer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">representative_weight_quantizer</span></code></a></p></td>
+<td><p>Return the representative weight quantizer for <code class="docutils literal notranslate"><span class="pre">weight_name</span></code> on <code class="docutils literal notranslate"><span class="pre">module</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.quantization.utils.update_quant_cfg_with_kv_cache_quant" title="modelopt.torch.quantization.utils.update_quant_cfg_with_kv_cache_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">update_quant_cfg_with_kv_cache_quant</span></code></a></p></td>
 <td><p>Update the quant_cfg with the kv cache quant_cfg.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#modelopt.torch.quantization.utils.weight_attr_names" title="modelopt.torch.quantization.utils.weight_attr_names"><code class="xref py py-obj docutils literal notranslate"><span class="pre">weight_attr_names</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#modelopt.torch.quantization.utils.weight_attr_names" title="modelopt.torch.quantization.utils.weight_attr_names"><code class="xref py py-obj docutils literal notranslate"><span class="pre">weight_attr_names</span></code></a></p></td>
 <td><p>Get the weight param attribute names in a converted module, non-recursive.</p></td>
 </tr>
 </tbody>
@@ -320,6 +323,28 @@ reduces all dimensions. Must be in the range [-rank(input_tensor), rank(input_te
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="modelopt.torch.quantization.utils.representative_weight_quantizer">
+<span class="sig-name descname"><span class="pre">representative_weight_quantizer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">module</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weight_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'weight'</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.quantization.utils.representative_weight_quantizer" title="Link to this definition"></a></dt>
+<dd><p>Return the representative weight quantizer for <code class="docutils literal notranslate"><span class="pre">weight_name</span></code> on <code class="docutils literal notranslate"><span class="pre">module</span></code>.</p>
+<p>Handles two layouts:</p>
+<ul class="simple">
+<li><p>singular <code class="docutils literal notranslate"><span class="pre">&lt;name&gt;_weight_quantizer</span></code> — standard <code class="docutils literal notranslate"><span class="pre">nn.Linear</span></code> / <code class="docutils literal notranslate"><span class="pre">_QuantLinear</span></code>.</p></li>
+<li><p>plural <code class="docutils literal notranslate"><span class="pre">&lt;name&gt;_weight_quantizers</span></code> (<code class="docutils literal notranslate"><span class="pre">nn.ModuleList</span></code>) — fused-experts modules
+(<code class="docutils literal notranslate"><span class="pre">_QuantFusedExperts</span></code>) hold one <code class="docutils literal notranslate"><span class="pre">TensorQuantizer</span></code> per expert. Per-expert
+formats are identical, so the first element is representative.</p></li>
+</ul>
+<p>Returns <code class="docutils literal notranslate"><span class="pre">None</span></code> if no matching quantizer is found.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>module</strong> (<em>Module</em>)</p></li>
+<li><p><strong>weight_name</strong> (<em>str</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="modelopt.torch.quantization.utils.update_quant_cfg_with_kv_cache_quant">
 <span class="sig-name descname"><span class="pre">update_quant_cfg_with_kv_cache_quant</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">quant_cfg</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_quant_cfg</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.quantization.utils.update_quant_cfg_with_kv_cache_quant" title="Link to this definition"></a></dt>
 <dd><p>Update the quant_cfg with the kv cache quant_cfg.</p>
@@ -344,9 +369,14 @@ typically <code class="docutils literal notranslate"><span class="pre">some_kv_c
 <dt class="sig sig-object py" id="modelopt.torch.quantization.utils.weight_attr_names">
 <span class="sig-name descname"><span class="pre">weight_attr_names</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">module</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#modelopt.torch.quantization.utils.weight_attr_names" title="Link to this definition"></a></dt>
 <dd><p>Get the weight param attribute names in a converted module, non-recursive.</p>
-<p>We consider the following two cases for each weight param attribute:
-- The standard weight attribute (e.g. nn.Linear).
-- The custom <cite>weight_attr_name</cite>. (e.g. Llama4TextExperts has weight attributes <cite>gate_up_proj</cite> and <cite>down_proj</cite>)</p>
+<p>Covers three layouts:</p>
+<ul class="simple">
+<li><p>standard <code class="docutils literal notranslate"><span class="pre">nn.Linear</span></code>: <code class="docutils literal notranslate"><span class="pre">weight</span></code> + <code class="docutils literal notranslate"><span class="pre">weight_quantizer</span></code>.</p></li>
+<li><p>custom per-weight quantizer (e.g. <code class="docutils literal notranslate"><span class="pre">Llama4TextExperts</span></code> with <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code> +
+<code class="docutils literal notranslate"><span class="pre">gate_up_proj_weight_quantizer</span></code>).</p></li>
+<li><p>fused-experts <code class="docutils literal notranslate"><span class="pre">nn.ModuleList</span></code> quantizers (<code class="docutils literal notranslate"><span class="pre">_QuantFusedExperts</span></code> with
+<code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code> + <code class="docutils literal notranslate"><span class="pre">gate_up_proj_weight_quantizers</span></code> plural list).</p></li>
+</ul>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>module</strong> (<em>Module</em>)</p>

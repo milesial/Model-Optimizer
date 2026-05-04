@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>fp4_kernel &mdash; Model Optimizer 0.0.1.dev1+gd11b33ced</title>
+  <title>fp4_kernel &mdash; Model Optimizer 0.0.1.dev1+g95d73d3ec</title>
       <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
       <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
@@ -231,8 +231,14 @@ operations using Triton kernels.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>x</strong> (<em>Tensor</em>) – [NUM_FP4_BLOCKS, BLOCK_SIZE] on CUDA.</p></li>
-<li><p><strong>amax</strong> (<em>Tensor</em>) – [NUM_FP4_BLOCKS] or [NUM_FP4_BLOCKS, 1] per-block amax values.</p></li>
+<li><p><strong>x</strong> (<em>Tensor</em>) – Input tensor on CUDA. The last dim must be the block dim (each consecutive
+<code class="docutils literal notranslate"><span class="pre">BLOCK_SIZE</span></code> elements form one FP4 block). Any number of leading dims
+is supported — they’re flattened internally and the shape is restored
+on output (so MoE expert weights <code class="docutils literal notranslate"><span class="pre">(E,</span> <span class="pre">F,</span> <span class="pre">K)</span></code> work the same as plain
+linear weights <code class="docutils literal notranslate"><span class="pre">(N,</span> <span class="pre">K)</span></code>).</p></li>
+<li><p><strong>amax</strong> (<em>Tensor</em>) – Per-block amax values. <code class="docutils literal notranslate"><span class="pre">amax.numel()</span></code> must equal
+<code class="docutils literal notranslate"><span class="pre">x.numel()</span> <span class="pre">//</span> <span class="pre">BLOCK_SIZE</span></code>. Shape is otherwise free; the kernel
+consumes it as a flat 1-D buffer of length <code class="docutils literal notranslate"><span class="pre">NUM_FP4_BLOCKS</span></code>.</p></li>
 <li><p><strong>global_amax</strong> (<em>Tensor</em><em> | </em><em>None</em>) – FP32 scalar global amax. If provided, used to compute scale_fp8_quant_amax.</p></li>
 <li><p><strong>quantize_block_scales</strong> (<em>bool</em>) – If True, quantize block scales to FP8.</p></li>
 <li><p><strong>out_dtype</strong> (<em>dtype</em><em> | </em><em>None</em>) – Output dtype. Defaults to x.dtype if None.</p></li>
