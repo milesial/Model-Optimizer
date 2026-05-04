@@ -34,8 +34,8 @@ from .acceptance_rate import AcceptanceRate
 
 
 class SpecBench(AcceptanceRate):
-    def __init__(self, requests):
-        super().__init__()
+    def __init__(self, requests, max_step_size=None):
+        super().__init__(max_step_size=max_step_size)
         if not_installed:
             raise ImportError(
                 "Please install rich, matplotlib, seaborn, and pandas to use the SpecBench metric"

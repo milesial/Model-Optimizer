@@ -20,10 +20,41 @@ from .base import Metric
 
 
 class AcceptanceRate(Metric):
-    def __init__(self):
+    def __init__(self, max_step_size=None):
+        """Acceptance-rate / acceptance-length metric.
+
+        Args:
+            max_step_size: Optional cap on the number of tokens that a
+                single speculative-decoding step can emit (typically
+                ``draft_length + 1``). When set, any per-yield length
+                ``L > max_step_size`` is split into
+                ``K = ceil(L / max_step_size)`` synthetic steps with
+                lengths ``[max_step_size] * (K-1) + [L - max_step_size *
+                (K-1)]`` so total tokens are preserved. This corrects
+                for async stream coalescing where the engine queues up
+                multiple verify-step outputs and the consumer drains
+                them in a single ``async for`` iteration -- without the
+                split, those iterations are mis-counted as one giant
+                step and inflate ``Average_AR`` and the
+                ``Acceptance_Length_Histogram``. Leave as ``None`` for
+                backward-compatible (uncorrected) behaviour.
+        """
         super().__init__()
         self.prompt_ar = {}
         self.name = "acceptance_rate"
+        self.max_step_size = max_step_size
+
+    def _split_coalesced(self, length):
+        """Yield per-step lengths for one coalesced async-stream yield."""
+        m = self.max_step_size
+        if m is None or length <= m:
+            yield length
+            return
+        full, rem = divmod(length, m)
+        for _ in range(full):
+            yield m
+        if rem:
+            yield rem
 
     def process_step(self, step_outputs, request_id, turn_id):
         if request_id not in self.prompt_ar:
@@ -32,7 +63,8 @@ class AcceptanceRate(Metric):
             self.prompt_ar[request_id][turn_id] = []
         for i, beam_output in enumerate(step_outputs["output_ids"]):
             for output_id_iter in beam_output:
-                self.prompt_ar[request_id][turn_id].append(len(output_id_iter))
+                for step_len in self._split_coalesced(len(output_id_iter)):
+                    self.prompt_ar[request_id][turn_id].append(step_len)
 
     def _get_lengths(self, turn, lengths):
         for j in turn:

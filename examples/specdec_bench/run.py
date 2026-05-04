@@ -161,15 +161,22 @@ def run_simple(args):
         **engine_args,
     )
 
+    # Only clamp coalesced async-stream yields when spec decoding is on.
+    # Non-spec runs always emit at most 1 token per yield, so no split needed.
+    spec_active = args.speculative_algorithm not in (None, "NONE")
+    max_step_size = (args.draft_length + 1) if spec_active else None
+
     metrics_list = [metrics.Timing(args.tp_size)]
     if args.aa_timing:
         metrics_list.append(metrics.AATiming(tokenizer))
     if args.mtbench is not None:
         metrics_list.insert(0, metrics.MTBench())
     elif args.specbench is not None or args.dataset == "speed":
-        metrics_list.insert(0, metrics.SpecBench(requests=dataset.data))
+        metrics_list.insert(
+            0, metrics.SpecBench(requests=dataset.data, max_step_size=max_step_size)
+        )
     else:
-        metrics_list.insert(0, metrics.AcceptanceRate())
+        metrics_list.insert(0, metrics.AcceptanceRate(max_step_size=max_step_size))
 
     if args.save_dir is not None:
         for metric in metrics_list:
